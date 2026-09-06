@@ -1,0 +1,64 @@
+# Backup archives & checksums
+*.tar.gz
+*.tar.xz
+*.tgz
+*.tar
+*.sha256
+*.sha256sum
+*.md5
+
+# Extracted recovery metadata & temporary files
+_sysinfo/
+*.tmp
+*.tmp.*
+.*.tmp.*
+openbsd_backup_*
+openbsd_sysinfo.*
+openbsd_tar_err.*
+restore_work.*
+*.lock
+*.sock
+
+# Test artifacts
+openbsd_backup_test.*
+obsd_test.*
+scratch/
+
+# System core dumps, logs & editor artifacts
+*.core
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+*.log
+
+# IDE & workspace artifacts
+.vscode/
+.idea/
+.direnv/
+.env
+
+### macOS
+# Finder metadata
+.DS_Store
+
+# Thumbnails
+._*
+
+# Custom folder icons
+Icon?
+
+# Volume root files
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+### Windows
+Thumbs.db
+ehthumbs.db
