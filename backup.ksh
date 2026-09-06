@@ -87,6 +87,13 @@ Options & Exclusions:
   -n, --notify              Send desktop notification on completion (desktop/laptop profile)
   -v, --verbose             Enable verbose output during tar archiving
   -h, --help                Display this help message and exit
+
+Security, Signing & Ownership:
+  -S, --sign KEY_FILE       Sign archive using OpenBSD signify(1) secret key
+      --skip-secrets        Exclude credentials, hashes, private keys, and DB dumps
+                            (enabled by default on 'config' profile)
+      --chown               Allow assigning archive ownership to calling user
+                            (permitted when --skip-secrets is active)
 EOF
 }
 
@@ -132,6 +139,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM QUIT
 
+# Safe shell-escaping helper to prevent command injection in subshells
+shell_escape() {
+    typeset s="$1"
+    printf "%s" "$s" | sed "s/'/'\\\\''/g"
+}
+
 # Detect invoking non-root user when run via doas/sudo
 if [ -n "$DOAS_USER" ]; then
     FINAL_USER="$DOAS_USER"
@@ -162,6 +175,9 @@ NO_EXCLUDES=0
 SEND_NOTIFY=0
 VERBOSE=0
 FORCE=0
+SIGN_KEY=""
+SKIP_SECRETS=0
+FORCE_CHOWN=0
 set -A USER_EXCLUDES
 EXCLUDE_FILE=""
 
@@ -284,6 +300,23 @@ while [ $# -gt 0 ]; do
             ;;
         -v|--verbose)
             VERBOSE=1
+            shift
+            ;;
+        -S|--sign)
+            if [[ -n "$2" && "$2" != -* ]] && [ -f "$2" ]; then
+                SIGN_KEY="$2"
+                shift 2
+            else
+                echo "Error: --sign requires a valid secret key file path." >&2
+                exit 1
+            fi
+            ;;
+        --skip-secrets|--no-secrets)
+            SKIP_SECRETS=1
+            shift
+            ;;
+        --chown)
+            FORCE_CHOWN=1
             shift
             ;;
         *)
@@ -434,6 +467,12 @@ case "$PROFILE" in
         ;;
 esac
 
+# Auto-skip secrets on 'config' profile unless explicitly disabled
+if [ "$PROFILE" = "config" ] && [ "$SKIP_SECRETS" -eq 0 ]; then
+    SKIP_SECRETS=1
+    echo "Notice: Config profile active: System secrets and password hashes excluded by default."
+fi
+
 # Pre-flight check: Laptop battery level and AC status
 if [ "$PROFILE" = "laptop" ] && command -v apm >/dev/null 2>&1; then
     AC_STATUS=$(apm -a 2>/dev/null || echo 255)
@@ -489,7 +528,12 @@ check_disk_space() {
     if [ -n "$avail_kb" ]; then
         avail_mb=$((avail_kb / 1024))
         if [ "$avail_mb" -lt "$min_mb" ]; then
-            echo "Warning: Low disk space on ${target_path} (${avail_mb}MB free, recommended >= ${min_mb}MB)." >&2
+            if [ "$FORCE" -eq 1 ]; then
+                echo "Warning: Low disk space on ${target_path} (${avail_mb}MB free, required >= ${min_mb}MB). Continuing due to --force." >&2
+            else
+                echo "Error: Insufficient disk space on ${target_path} (${avail_mb}MB free, required >= ${min_mb}MB). Aborting (use --force to override)." >&2
+                exit 1
+            fi
         fi
     fi
 }
@@ -554,7 +598,7 @@ check_disk_space "${SCRATCH_DIR}" 100
 # Stage temporary archive directly in destination filesystem
 # Prevents exhausting small OpenBSD /tmp (500MB-1GB) or /var/tmp partitions,
 # and enables instantaneous atomic rename without cross-device data copying.
-TMP_BACKUP_FILE="${FINAL_DEST_DIR}/.${ARCHIVE_BASENAME}.tmp.$$"
+TMP_BACKUP_FILE=$(mktemp "${FINAL_DEST_DIR}/.${ARCHIVE_BASENAME}.tmp.XXXXXXXXXX")
 SYSINFO_DIR=$(mktemp -d "${SCRATCH_DIR}/openbsd_sysinfo.XXXXXXXXXX")
 TAR_ERR_FILE=$(mktemp "${SCRATCH_DIR}/openbsd_tar_err.XXXXXXXXXX")
 
@@ -575,7 +619,7 @@ if [ "$PROFILE" = "config" ]; then
         if [ -d "$user_dir" ] && [ ! -L "$user_dir" ]; then
             u_rel="${user_dir#/}"
             for dotitem in \
-                .config .local/bin .local/share bin \
+                .config .local/bin bin \
                 .xsession .xinitrc .Xdefaults .Xresources .xprofile \
                 .cwmrc .fvwmrc .dwm .i3 .sway \
                 .profile .kshrc .zshrc .bashrc .tmux.conf \
@@ -638,7 +682,14 @@ set -A TAR_EXCLUDES
 add_exclude_rule() {
     typeset pat="$1"
     [ -z "$pat" ] && return 0
-    set -A TAR_EXCLUDES -- "${TAR_EXCLUDES[@]}" -s ",${pat},,"
+    typeset delim=","
+    if [[ "$pat" == *","* ]]; then
+        delim="@"
+        if [[ "$pat" == *"@"* ]]; then
+            delim=":"
+        fi
+    fi
+    set -A TAR_EXCLUDES -- "${TAR_EXCLUDES[@]}" -s "${delim}${pat}${delim}${delim}"
 }
 
 add_exclude_dir() {
@@ -688,9 +739,50 @@ add_user_exclude() {
     fi
 }
 
+# Security & Secrets Protection (when --skip-secrets is active or on config profile)
+if [ "$SKIP_SECRETS" -eq 1 ]; then
+    echo "Applying security exclusions (--skip-secrets active)..."
+    # System credential hashes and shadow files (preserve /etc/passwd for UID/GID mapping)
+    add_exclude_rule "^etc/master\.passwd\$"
+    add_exclude_rule ".*/etc/master\.passwd\$"
+    add_exclude_rule "^etc/spwd\.db\$"
+    add_exclude_rule ".*/etc/spwd\.db\$"
+    add_exclude_rule "^etc/shadow\$"
+    add_exclude_rule ".*/etc/shadow\$"
+    add_exclude_rule "^etc/skey\$"
+    add_exclude_rule ".*/etc/skey\$"
+
+    # SSH host private keys (preserve public keys)
+    add_exclude_rule "^etc/ssh/ssh_host_.*_key\$"
+    add_exclude_rule ".*/etc/ssh/ssh_host_.*_key\$"
+
+    # TLS and VPN private keys
+    add_exclude_rule "^etc/ssl/private/.*"
+    add_exclude_rule "^etc/ssl/private\$"
+    add_exclude_rule ".*/etc/ssl/private/.*"
+    add_exclude_rule ".*/etc/ssl/private\$"
+    add_exclude_rule "^etc/wireguard/.*\.key\$"
+    add_exclude_rule ".*/etc/wireguard/.*\.key\$"
+    add_exclude_rule "^etc/ipsec\.secrets\$"
+    add_exclude_rule ".*/etc/ipsec\.secrets\$"
+
+    # User private SSH keys and credentials
+    add_exclude_rule ".*\.ssh/id_.*"
+    add_exclude_rule ".*\.ssh/.*\.pem\$"
+    add_exclude_rule ".*\.ssh/.*\.key\$"
+    add_exclude_rule ".*\.gnupg/private-keys-v1\.d/.*"
+    add_exclude_rule ".*\.gnupg/secring\.gpg\$"
+    add_exclude_rule ".*\.password-store/.*"
+
+    # Disable database dumps when skipping secrets
+    BACKUP_MARIADB=0
+    BACKUP_POSTGRES=0
+fi
+
 # Fundamental Loop & Recursion Protection (ALWAYS enforced to prevent corrupting archives)
 add_exclude_rule ".*_backup_.*\.tar\..*"
 add_exclude_rule ".*_backup_.*\.sha256"
+add_exclude_rule ".*_backup_.*\.sig"
 add_exclude_rule ".*/\..*\.tmp\..*"
 add_exclude_rule ".*\.tmp\.[0-9]*"
 add_exclude_rule ".*\.tar\.gz\$"
@@ -794,6 +886,7 @@ if [ "$BACKUP_MARIADB" -eq 1 ]; then
             rm -f "${SYSINFO_DIR}/mariadb_all_databases.sql.gz"
             echo "Warning: MariaDB dump failed or daemon not running. Continuing..." >&2
         fi
+        unset MYSQL_PWD DB_PASS
     else
         echo "Warning: mysqldump command not found. Skipping MariaDB dump." >&2
     fi
@@ -1153,9 +1246,34 @@ elif command -v shasum >/dev/null 2>&1; then
     ( cd "${FINAL_DEST_DIR}" && shasum -a 256 "${FINAL_ARCHIVE_PATH##*/}" > "${FINAL_ARCHIVE_PATH##*/}.sha256" )
 fi
 
-# Assign ownership to calling non-root user if run via doas
+# Cryptographic signing via OpenBSD signify(1)
+if [ -z "$SIGN_KEY" ] && [ -f "/etc/signify/backup.sec" ]; then
+    SIGN_KEY="/etc/signify/backup.sec"
+fi
+
+if [ -n "$SIGN_KEY" ]; then
+    if command -v signify >/dev/null 2>&1; then
+        echo "Signing archive with OpenBSD signify (${SIGN_KEY})..."
+        if ( cd "${FINAL_DEST_DIR}" && signify -S -s "$SIGN_KEY" -m "${FINAL_ARCHIVE_PATH##*/}" -x "${FINAL_ARCHIVE_PATH##*/}.sig" ); then
+            echo "Archive signed successfully: ${FINAL_ARCHIVE_PATH}.sig"
+        else
+            echo "Error: signify signing failed!" >&2
+            exit 1
+        fi
+    else
+        echo "Warning: signify command not found. Skipping archive signing." >&2
+    fi
+fi
+
+# Assign ownership to calling non-root user if run via doas/sudo
 if [ -n "$DOAS_USER" ] || [ -n "$SUDO_USER" ]; then
-    chown "${FINAL_USER}" "${FINAL_ARCHIVE_PATH}" "${FINAL_ARCHIVE_PATH}.sha256" 2>/dev/null || true
+    if [ "$SKIP_SECRETS" -eq 1 ] || [ "$FORCE_CHOWN" -eq 1 ]; then
+        chown "${FINAL_USER}" "${FINAL_ARCHIVE_PATH}" "${FINAL_ARCHIVE_PATH}.sha256" 2>/dev/null || true
+        [ -f "${FINAL_ARCHIVE_PATH}.sig" ] && chown "${FINAL_USER}" "${FINAL_ARCHIVE_PATH}.sig" 2>/dev/null || true
+    else
+        echo "Notice: Archive contains system credentials and private keys."
+        echo "        Ownership retained as root:wheel (0600) for security. Use --chown to override."
+    fi
 fi
 
 # ==============================================================================
@@ -1165,8 +1283,14 @@ if [ "$KEEP_COUNT" -gt 0 ]; then
     echo "Applying retention policy (keeping last ${KEEP_COUNT} backups)..."
     ARCHIVE_PREFIX="${HOSTNAME}_${PROFILE}_backup_"
     
-    # List backups in chronological order (oldest first)
-    set -A EXISTING_BACKUPS $(ls -tr "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tar.* 2>/dev/null || true)
+    # List backups in chronological order (oldest first), safely handling paths with spaces
+    set -A EXISTING_BACKUPS
+    while IFS= read -r f || [ -n "$f" ]; do
+        [ -f "$f" ] && set -A EXISTING_BACKUPS -- "${EXISTING_BACKUPS[@]}" "$f"
+    done <<EOF
+$(ls -1tr "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tar.* 2>/dev/null || true)
+EOF
+
     TOTAL_COUNT=${#EXISTING_BACKUPS[@]}
 
     if [ "$TOTAL_COUNT" -gt "$KEEP_COUNT" ]; then
@@ -1176,7 +1300,7 @@ if [ "$KEEP_COUNT" -gt 0 ]; then
             OLD_FILE="${EXISTING_BACKUPS[$i]}"
             if [ -f "$OLD_FILE" ]; then
                 echo "Pruning old archive: ${OLD_FILE##*/}"
-                rm -f "$OLD_FILE" "${OLD_FILE}.sha256" 2>/dev/null || true
+                rm -f "$OLD_FILE" "${OLD_FILE}.sha256" "${OLD_FILE}.sig" 2>/dev/null || true
             fi
             i=$((i + 1))
         done
@@ -1189,17 +1313,26 @@ fi
 if [ -n "$UPLOAD_DEST" ]; then
     echo "Uploading archive and checksum to ${UPLOAD_DEST}..."
     UPLOAD_SUCCESS=0
+    ESC_ARCHIVE=$(shell_escape "$FINAL_ARCHIVE_PATH")
+    ESC_SHA=$(shell_escape "${FINAL_ARCHIVE_PATH}.sha256")
+    ESC_DEST=$(shell_escape "$UPLOAD_DEST")
+    EXTRA_SIG=""
+    if [ -f "${FINAL_ARCHIVE_PATH}.sig" ]; then
+        ESC_SIG=$(shell_escape "${FINAL_ARCHIVE_PATH}.sig")
+        EXTRA_SIG="'${ESC_SIG}'"
+    fi
+
     # Use invoking user's SSH keys and agent when run under doas
     if [ -n "$DOAS_USER" ]; then
-        if su -l "$DOAS_USER" -c "scp -q '${FINAL_ARCHIVE_PATH}' '${FINAL_ARCHIVE_PATH}.sha256' '${UPLOAD_DEST}'"; then
+        if su -l "$DOAS_USER" -c "scp -q '${ESC_ARCHIVE}' '${ESC_SHA}' ${EXTRA_SIG} '${ESC_DEST}'"; then
             UPLOAD_SUCCESS=1
         fi
     elif [ -n "$SUDO_USER" ]; then
-        if su -l "$SUDO_USER" -c "scp -q '${FINAL_ARCHIVE_PATH}' '${FINAL_ARCHIVE_PATH}.sha256' '${UPLOAD_DEST}'"; then
+        if su -l "$SUDO_USER" -c "scp -q '${ESC_ARCHIVE}' '${ESC_SHA}' ${EXTRA_SIG} '${ESC_DEST}'"; then
             UPLOAD_SUCCESS=1
         fi
     else
-        if scp -q "${FINAL_ARCHIVE_PATH}" "${FINAL_ARCHIVE_PATH}.sha256" "${UPLOAD_DEST}"; then
+        if scp -q "${FINAL_ARCHIVE_PATH}" "${FINAL_ARCHIVE_PATH}.sha256" ${EXTRA_SIG:+"${FINAL_ARCHIVE_PATH}.sig"} "${UPLOAD_DEST}"; then
             UPLOAD_SUCCESS=1
         fi
     fi
@@ -1218,10 +1351,13 @@ ARCHIVE_SIZE=$(ls -lh "${FINAL_ARCHIVE_PATH}" | awk '{print $5}')
 if [ "$SEND_NOTIFY" -eq 1 ] && [ -n "$FINAL_USER" ]; then
     NOTIFY_TITLE="OpenBSD Backup Complete"
     NOTIFY_MSG="Archive: ${FINAL_ARCHIVE_PATH##*/}\nSize: ${ARCHIVE_SIZE}\nProfile: ${PROFILE}"
+    ESC_TITLE=$(shell_escape "$NOTIFY_TITLE")
+    ESC_MSG=$(shell_escape "$NOTIFY_MSG")
+    ESC_BASE=$(shell_escape "${FINAL_ARCHIVE_PATH##*/}")
     if command -v notify-send >/dev/null 2>&1; then
-        su -l "$FINAL_USER" -c "notify-send -i drive-harddisk '${NOTIFY_TITLE}' '${NOTIFY_MSG}'" 2>/dev/null || true
+        su -l "$FINAL_USER" -c "notify-send -i drive-harddisk '${ESC_TITLE}' '${ESC_MSG}'" 2>/dev/null || true
     elif command -v xmessage >/dev/null 2>&1 && [ -n "$DISPLAY" ]; then
-        su -l "$FINAL_USER" -c "xmessage -center -buttons OK:0 '${NOTIFY_TITLE}: ${FINAL_ARCHIVE_PATH##*/} (${ARCHIVE_SIZE})'" 2>/dev/null || true
+        su -l "$FINAL_USER" -c "xmessage -center -buttons OK:0 '${ESC_TITLE}: ${ESC_BASE} (${ARCHIVE_SIZE})'" 2>/dev/null || true
     fi
 fi
 

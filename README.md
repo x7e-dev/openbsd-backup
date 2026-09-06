@@ -20,6 +20,11 @@ Engineered with specialized support for:
 - [Quick Start](#quick-start)
   - [1. Creating Backups (`backup.ksh`)](#1-creating-backups-backupksh)
   - [2. Inspecting & Restoring (`restore.ksh`)](#2-inspecting--restoring-restoreksh)
+- [Security, Signing & Secrets Hardening](#security-signing--secrets-hardening)
+  - [OpenBSD signify(1) Cryptographic Signatures](#openbsd-signify1-cryptographic-signatures)
+  - [Secrets Isolation (`--skip-secrets`)](#secrets-isolation---skip-secrets)
+  - [Ownership Model & Privilege Containment (`--chown`)](#ownership-model--privilege-containment---chown)
+  - [Live Restoration Guardrails & Safety Snapshots](#live-restoration-guardrails--safety-snapshots)
 - [Privilege & Permissions Matrix](#privilege--permissions-matrix)
 - [Complete Command Reference](#complete-command-reference)
   - [`backup.ksh`](#backupksh)
@@ -51,16 +56,20 @@ Engineered with specialized support for:
   - **UNIX Domain Socket Exclusions:** Proactively skips active IPC sockets (`.gnupg/S.*`, `*.sock`, `*.socket`), preventing OpenBSD `ustar` archiving errors and socket corruption.
   - **Laptop Battery Protection:** Pre-flight battery check warns or prevents running heavy compression operations on low battery (≤ 20%) to avoid sudden shutdown.
   - **Adaptive Multi-Core XZ Compression:** Uses multi-threaded compression (`-T0`) on systems with > 1GB RAM, while restricting XZ dictionary memory on low-memory VPS instances (≤ 1GB RAM) to prevent kernel OOM killer panics.
-- **Hardened Security by Default:** Enforces `umask 077` throughout execution (`0600` archive / `0700` working directories), guaranteeing sensitive data (such as `/etc/master.passwd`, SSH host keys, WireGuard keys, and database dumps) is never world-readable.
+- **Hardened Security by Default:**
+  - Enforces `umask 077` throughout both `backup.ksh` and `restore.ksh` (`0600` archive / `0700` working directories), guaranteeing sensitive data (such as `/etc/master.passwd`, SSH host keys, WireGuard keys, and database dumps) is never world-readable.
+  - **Cryptographic Signatures (`signify`):** Native OpenBSD `signify(1)` archive signing (`-S / --sign`) and verification (`--sig-key`), ensuring authenticity and tamper prevention.
+  - **Secrets Isolation (`--skip-secrets`):** Safely excludes password hashes, private host/user keys, and databases for untrusted destinations or environment sync; enabled by default on the `config` profile.
+  - **Strict Archive Ownership:** Backups containing system secrets retain `root:wheel` (`0600`) ownership to prevent privilege leakage to non-root users (`--chown` permits transfer when secrets are excluded).
+  - **Live Restoration Guardrails:** `restore.ksh` creates an automatic `/var/backups/etc.pre-restore.<timestamp>.tar.gz` safety snapshot and prompts for confirmation before overwriting live configurations.
 - **Production-Grade Reliability:**
   - File locking (`/var/run/openbsd-backup.lock`) with active PID detection to prevent overlapping cron runs.
-  - Pre-flight storage checks (`df -k`) on scratch and target directories.
+  - Pre-flight storage checks (`df -k`) on scratch and target directories with fail-safe aborts to prevent filesystem exhaustion.
   - Streaming database compression (`.sql.gz`) to preserve scratch storage.
   - Proactive UNIX domain socket filtering with post-creation integrity validation (`tar -tzf` / `-tJf`).
   - True atomic archive deployment (same-filesystem instantaneous rename).
-  - Preserves invoking user ownership (`$DOAS_USER`) so non-root users can manage their archives.
-  - Automated retention pruning (`--keep N`) for archives and companion `.sha256` files.
-  - Offsite SCP upload preserving user SSH identity and authentication agent (`su -l "$DOAS_USER"`).
+  - Automated retention pruning (`--keep N`) for archives, companion `.sha256`, and `.sig` files.
+  - Offsite SCP upload with safe shell-escaped parameter handling (`su -l "$DOAS_USER"`).
 
 ---
 
@@ -192,8 +201,14 @@ doas backup.ksh -p desktop -n
 # Cloud VPS / Virtual Machine backup with offsite SCP transfer:
 doas backup.ksh -p vps -w -u backupuser@nas.lan:/storage/vps-backups/
 
-# Ultra-Fast Config & Dotfiles Backup (fast sync, <20MB):
+# Ultra-Fast Config & Dotfiles Backup (fast sync, <20MB, secrets stripped by default):
 doas backup.ksh -p config
+
+# Cryptographically sign archive using OpenBSD signify(1):
+doas backup.ksh -S /etc/signify/backup.sec
+
+# Dotfiles & configuration backup stripped of secrets (safe for git/sharing, chowned to user):
+doas backup.ksh -p config --skip-secrets --chown
 
 # Automated Backup keeping only the 7 most recent archives (prunes older backups):
 doas backup.ksh -k 7
@@ -210,8 +225,8 @@ doas backup.ksh -J -d /mnt/usbdrive
 # 1. Inspect archive metadata, hardware type, DUIDs, packages, and daemons (no root needed):
 restore.ksh --show-info hostname_server_backup_2026.09.05-12.00.00.tar.gz
 
-# 2. Verify archive SHA256 checksum and tar integrity:
-restore.ksh --verify hostname_server_backup_2026.09.05-12.00.00.tar.gz
+# 2. Verify archive SHA256 checksum, tar integrity, and signify signature:
+restore.ksh --verify -S /etc/signify/backup.pub hostname_server_backup_2026.09.05-12.00.00.tar.gz
 
 # 3. Diff archive files against the live filesystem before applying changes:
 restore.ksh --diff hostname_server_backup_2026.09.05-12.00.00.tar.gz /etc
@@ -222,7 +237,7 @@ restore.ksh --list hostname_server_backup_2026.09.05-12.00.00.tar.gz pf.conf
 # 5. Simulate a restore without touching the filesystem (Dry-Run):
 restore.ksh --config-only --dry-run hostname_server_backup_2026.09.05-12.00.00.tar.gz
 
-# 6. Restore only /etc, /root, and user dotfiles:
+# 6. Restore only /etc, /root, and user dotfiles (prompts confirmation & saves /etc snapshot):
 doas restore.ksh --config-only hostname_server_backup_2026.09.05-12.00.00.tar.gz
 
 # 7. Extract archive into a staging or chroot directory:
@@ -230,7 +245,81 @@ doas restore.ksh --full --dest /mnt/staging hostname_server_backup_2026.09.05-12
 
 # 8. Complete bare-metal turnkey restore (files + packages + services + firmware):
 doas restore.ksh --all hostname_server_backup_2026.09.05-12.00.00.tar.gz
+
+# 9. Non-interactive automated restore (bypasses prompt, verifies signature, preserves safety snapshot):
+doas restore.ksh --config-only -f hostname_server_backup_2026.09.05-12.00.00.tar.gz
 ```
+
+---
+
+## Security, Signing & Secrets Hardening
+
+The toolkit implements defense-in-depth security principles engineered specifically for production OpenBSD deployments.
+
+### OpenBSD signify(1) Cryptographic Signatures
+OpenBSD's native `signify(1)` utility creates and verifies lightweight, cryptographically secure Ed25519 digital signatures. By signing your archives, you guarantee that backups cannot be tampered with or corrupted before restoration by `root`.
+
+1. **Generate Signify Keypair:**
+   ```bash
+   doas mkdir -p /etc/signify
+   doas signify -G -p /etc/signify/backup.pub -s /etc/signify/backup.sec -c "OpenBSD Backup Signing Key"
+   doas chmod 600 /etc/signify/backup.sec
+   ```
+
+2. **Automatic Key Detection:**
+   - `backup.ksh` automatically detects `/etc/signify/backup.sec` if present and generates a companion `<archive>.sig` file.
+   - `restore.ksh` automatically detects `/etc/signify/backup.pub` and validates the signature during `--verify`, `--config-only`, and `--full` operations.
+
+3. **Explicit Key Path:**
+   ```bash
+   # Create signed archive with custom key:
+   doas backup.ksh -S /etc/signify/backup.sec
+
+   # Verify signed archive with public key:
+   restore.ksh --verify -S /etc/signify/backup.pub backup.tar.gz
+   ```
+
+4. **Lifecycle Integration:**
+   - Signatures (`.sig`) are automatically transferred alongside archives during offsite SCP uploads (`-u / --upload`).
+   - Old signature files are automatically pruned alongside archives by retention rules (`-k / --keep`).
+   - Loop prevention rules strictly prevent `.sig` files from being recursively ingested into future archives.
+
+### Secrets Isolation (`--skip-secrets`)
+When preparing archives for dotfile synchronization across multiple machines, distributing configs to public/team repositories, or uploading to third-party cloud storage, sensitive credentials must never be leaked.
+
+The `--skip-secrets` flag (automatically enabled by default on the `config` profile) applies strict regular expression exclusions:
+- **System Credential Databases:** Excludes `/etc/master.passwd`, `/etc/spwd.db`, `/etc/shadow`, and `/etc/skey`. Retains world-readable `/etc/passwd` so UID/GID mappings and login shells remain intact.
+- **SSH Host Private Keys:** Excludes `/etc/ssh/ssh_host_*_key`. Retains `/etc/ssh/ssh_host_*_key.pub` and user `authorized_keys`.
+- **TLS & VPN Credentials:** Excludes `/etc/ssl/private/*`, `/etc/wireguard/*.key`, and `/etc/ipsec.secrets`.
+- **User Identity Keys:** Excludes user private keys matching `~/.ssh/id_*`, `~/.ssh/*.pem`, `~/.ssh/*.key`, `~/.gnupg/private-keys-v1.d/*`, `~/.gnupg/secring.gpg`, and `~/.password-store/*`.
+- **Database Dumps:** Automatically skips MariaDB and PostgreSQL dumps when `--skip-secrets` is active to avoid database credential/data leakage.
+
+### Ownership Model & Privilege Containment (`--chown`)
+Because full system backups preserve root-owned credentials (`0600`), transferring archive ownership to a non-root user when running via `doas` or `sudo` would introduce privilege leakage on multi-user systems.
+
+- **Strict Root Ownership by Default:** Archives capturing complete system states retain `root:wheel` (`0600`) ownership and `0700` working directories (enforced via `umask 077` across both `backup.ksh` and `restore.ksh`).
+- **Automatic User Chown for Sanitized Archives:** When `--skip-secrets` is active (or when using `-p config`), the archive is verified free of sensitive system secrets. `backup.ksh` safely assigns ownership of the archive, checksum, and signature to the invoking non-root user (`$DOAS_USER` or `$SUDO_USER`).
+- **Explicit Override (`--chown`):** If you explicitly want the archive assigned to your calling user despite containing system secrets, specify `--chown`.
+
+### Live Restoration Guardrails & Safety Snapshots
+Restoring configuration or system files onto a running production machine carries operational risk. `restore.ksh` includes safeguards against accidental overwrites:
+
+1. **Pre-Restoration Integrity Verification:**
+   Before extracting files in `--config-only` (`-C`) or `--full` (`-F`) modes, `restore.ksh` verifies the archive's SHA256 checksum and cryptographic signature (if present). If verification fails, extraction aborts immediately.
+
+2. **Automated Safety Snapshot of `/etc`:**
+   Whenever files are being restored directly to `/` (`--dest /`), `restore.ksh` creates an automatic timestamped safety snapshot:
+   ```text
+   /var/backups/etc.pre-restore.YYYYMMDD-HHMMSS.tar.gz
+   ```
+   If a misconfiguration occurs during restoration, you can immediately roll back `/etc` to its exact pre-restore state. Disable this snapshot with `--no-backup` if disk space is severely restricted.
+
+3. **Interactive Overwrite Confirmation:**
+   When running interactively in a terminal, `restore.ksh` prompts for confirmation before overwriting live configurations or system files:
+   ```text
+   WARNING: This operation will overwrite configuration files in '/'. Proceed? [y/N]:
+   ```
+   Pass `-f` / `--force` to bypass this prompt for unattended automation and recovery scripts.
 
 ---
 
@@ -240,9 +329,13 @@ To adhere to the principle of least privilege, `restore.ksh` allows read-only an
 
 | Tool | Mode / Flag | Description | Requires Root (`doas`) |
 | :--- | :--- | :--- | :---: |
-| `backup.ksh` | *(all)* | System configuration & hardware state capture | **Yes** *(reads `/etc/master.passwd`, raw disk devices)* |
+| `backup.ksh` | *(all base operations)* | System configuration & hardware state capture | **Yes** *(reads `/etc/master.passwd`, raw disk devices)* |
+| `backup.ksh` | `-S, --sign KEY_FILE` | Sign archive with `signify(1)` secret key | **Yes** *(reads private signing key)* |
+| `backup.ksh` | `--skip-secrets` | Exclude credentials, hashes, private keys & DB dumps | **Yes** *(default on `config` profile)* |
+| `backup.ksh` | `--chown` | Assign archive ownership to invoking user | **Yes** *(permitted with `--skip-secrets` or override)* |
 | `restore.ksh` | `-i, --show-info` | Inspect archive manifest, packages, services, DUIDs | **No** |
-| `restore.ksh` | `-c, --verify` | Verify SHA256 checksum and tar integrity | **No** |
+| `restore.ksh` | `-c, --verify` | Verify SHA256 checksum, tar readability & signature | **No** |
+| `restore.ksh` | `-S, --sig-key PUBKEY`| Validate OpenBSD `signify` digital signature | **No** *(with `-c` / `-i`)* |
 | `restore.ksh` | `-d, --diff` | Diff archive files against live system | **No** *(unless inspecting root-only files)* |
 | `restore.ksh` | `-l, --list` | List or search contents within archive | **No** |
 | `restore.ksh` | `-C, --config-only` | Restore `/etc`, `/root`, and user dotfiles | **Yes** |
@@ -250,6 +343,8 @@ To adhere to the principle of least privilege, `restore.ksh` allows read-only an
 | `restore.ksh` | `-p, --install-pkgs`| Reinstall recorded packages via `pkg_add -l` | **Yes** |
 | `restore.ksh` | `-s, --enable-services` | Re-enable daemons via `rcctl` | **Yes** |
 | `restore.ksh` | `-a, --all` | Complete turnkey bare-metal rebuild | **Yes** |
+| `restore.ksh` | `-f, --force` | Bypass interactive confirmation and warnings | *Inherits mode requirement* |
+| `restore.ksh` | `--no-backup` | Bypass pre-restore safety `/etc` snapshot | *Inherits mode requirement* |
 | `quick-restore.sh` | *(embedded)* | Standalone rescue helper in `_sysinfo/` | **Yes** |
 
 ---
@@ -298,6 +393,13 @@ Options & Exclusions:
   -n, --notify              Send desktop notification on completion (desktop/laptop profile)
   -v, --verbose             Enable verbose output during tar archiving
   -h, --help                Display this help message and exit
+
+Security, Signing & Ownership:
+  -S, --sign KEY_FILE       Sign archive using OpenBSD signify(1) secret key
+      --skip-secrets        Exclude credentials, hashes, private keys, and DB dumps
+                            (enabled by default on 'config' profile)
+      --chown               Allow assigning archive ownership to calling user
+                            (permitted when --skip-secrets is active)
 ```
 
 ### `restore.ksh`
@@ -322,6 +424,9 @@ Modes (select one):
 
 Options:
   --dest DIR                   Target restore directory (default: /)
+  -S, --sig-key PUBKEY         Verify archive signature using OpenBSD signify(1) public key
+  -f, --force                  Bypass interactive confirmation and verification warnings
+      --no-backup              Do not create safety backup of /etc before restoring
   -n, --dry-run                Simulate restoration actions without modifying system
   -v, --verbose                Enable verbose extraction output
   -h, --help                   Display this help message and exit
@@ -335,12 +440,23 @@ Options:
 OpenBSD's native `tar(1)` (based on `pax(1)`) does not support GNU `--exclude` options. `backup.ksh` natively implements exclusions using OpenBSD `tar -s replstr` pattern substitution rules (`-s ',pattern,,'`), where paths that substitute to the empty string are not archived.
 
 To prevent accidental recursion, exponential archive expansion, socket errors, and corrupted backup data, `backup.ksh` strictly enforces these exclusions on every run across all profiles:
-- **Prior Backup Archives:** `.*_backup_.*\.tar\..*`, `.*\.tar\.gz$`, `.*\.tar\.xz$`, `.*\.tgz$`
-- **Integrity Checksums:** `.*_backup_.*\.sha256`, `.*\.sha256$`
+- **Prior Backup Archives & Signatures:** `.*_backup_.*\.tar\..*`, `.*\.tar\.gz$`, `.*\.tar\.xz$`, `.*\.tgz$`
+- **Integrity Checksums & Digital Signatures:** `.*_backup_.*\.sha256`, `.*\.sha256$`, `.*_backup_.*\.sig`, `.*\.sig$`
 - **Temporary Staging Files:** `.*/\..*\.tmp\..*`, `.*\.tmp\.[0-9]*`
 - **UNIX Domain Sockets:** `.*\.gnupg/S\..*`, `.*\.sock$`, `.*\.socket$` (OpenBSD `ustar` format cannot archive dynamic IPC sockets)
-- **Target Destination Files:** Automatically excludes destination archives and companion checksums when writing inside backed-up directories (e.g., `/var/backups`, `/home`, `/root`)
+- **Target Destination Files:** Automatically excludes destination archives, checksums, and signatures when writing inside backed-up directories (e.g., `/var/backups`, `/home`, `/root`)
 - **Foreign & Network Mounts:** Automatically parses active mount points to exclude foreign filesystems (`nfs`, `fuse`/sshfs, `mfs`) mounted under target directories
+
+> [!TIP]
+> **Delimiter Collision Safety:** When custom or built-in exclusion patterns contain commas (e.g. `pattern,with,commas`), `backup.ksh` dynamically switches the substitution delimiter from `,` to `@` or `:` (e.g., `-s '@pattern@@'`), preventing pattern corruption or tar syntax errors.
+
+### Secrets Isolation Exclusions (`--skip-secrets`)
+When `--skip-secrets` is enabled (or on the `config` profile), the following targets are automatically excluded:
+- System hashes and shadow tables: `/etc/master.passwd`, `/etc/spwd.db`, `/etc/shadow`, `/etc/skey`
+- Host private keys: `/etc/ssh/ssh_host_*_key` (public `.pub` keys and `authorized_keys` are preserved)
+- TLS & VPN keys: `/etc/ssl/private/*`, `/etc/wireguard/*.key`, `/etc/ipsec.secrets`
+- User private keys: `~/.ssh/id_*`, `~/.ssh/*.pem`, `~/.ssh/*.key`, `~/.gnupg/private-keys-v1.d/*`, `~/.gnupg/secring.gpg`, `~/.password-store/*`
+- Automated database dumps: MariaDB and PostgreSQL dumps are suppressed
 
 ### Default Cache & Ephemeral Exclusions
 In addition to loop safeguards, the `desktop` and `laptop` profiles skip ephemeral caches, build artifacts, and downloads (disable with `-N / --no-excludes` or include caches with `-C / --include-caches`):
@@ -377,7 +493,7 @@ When rebuilding a physical server with hardware RAID or softraid crypto volumes:
 2. **Re-create Volumes:** Initialize hardware RAID or reassemble the softraid crypto container using the commands saved in `softraid_recreate.txt` (e.g., `bioctl -c C -l <chunk_duid>.a softraid0`).
 3. **Restore Disklabel Slices:** Restore disk partition tables onto replacement drives using `disklabel -R <disk> _sysinfo/disklabel_<disk>.txt`.
 4. **Fresh Base Install:** Install standard OpenBSD base sets onto the new volume or partitions.
-5. **Turnkey Restore:** Run `doas restore.ksh --all backup.tar.gz` to reinstall all packages, re-enable services, and restore configuration files.
+5. **Turnkey Restore:** Run `doas restore.ksh --all -S /etc/signify/backup.pub backup.tar.gz` to reinstall all packages, re-enable services, and restore configuration files. `restore.ksh` verifies checksum & signify signatures, automatically captures an `/etc` safety snapshot, and prompts before overwriting live configurations.
 6. **Verify HA & Network:** Review `/etc/hostname.*` (CARP, trunk, VLAN interfaces) and `/etc/pf.conf` before rebooting.
 
 ### 2. Laptops & Mobile Notebooks
@@ -385,18 +501,18 @@ When restoring onto a new laptop drive or replacement machine:
 1. **Fresh Base Install:** Install standard OpenBSD base sets.
 2. **Turnkey Restore:** Run `doas restore.ksh --all backup.tar.gz`.
 3. **Verify Wi-Fi & Touchpad:**
-   - Confirm wireless network credentials in `/etc/hostname.<wifi-if>`.
-   - Verify touchpad tapping and scrolling settings in `/etc/wsconsctl.conf`.
-   - Ensure power daemon is enabled: `rcctl enable apmd && rcctl set apmd flags -A`.
+    - Confirm wireless network credentials in `/etc/hostname.<wifi-if>`.
+    - Verify touchpad tapping and scrolling settings in `/etc/wsconsctl.conf`.
+    - Ensure power daemon is enabled: `rcctl enable apmd && rcctl set apmd flags -A`.
 
 ### 3. Cloud VPS & Virtual Machines
 When recovering onto a newly deployed VPS instance (AWS, Vultr, DigitalOcean, Hetzner, etc.):
 1. **Deploy Minimal Instance:** Spin up a new OpenBSD instance or boot into recovery.
-2. **Turnkey Restore:** Transfer the archive and run `doas restore.ksh --all backup.tar.gz`.
+2. **Turnkey Restore:** Transfer the archive and run `doas restore.ksh --all -f backup.tar.gz` (using `-f` to bypass interactive prompts in serial console or cloud-init automation).
 3. **Verify Serial Console & SSH:**
-   - Confirm `/etc/boot.conf` retains `set tty com0` (required for cloud web consoles).
-   - Ensure SSH host keys (`/etc/ssh/ssh_host_*_key*`) and `/root/.ssh/authorized_keys` are intact before terminating the active session.
-   - Verify VirtIO interface configuration in `/etc/hostname.vio0`.
+    - Confirm `/etc/boot.conf` retains `set tty com0` (required for cloud web consoles).
+    - Ensure SSH host keys (`/etc/ssh/ssh_host_*_key*`) and `/root/.ssh/authorized_keys` are intact before terminating the active session.
+    - Verify VirtIO interface configuration in `/etc/hostname.vio0`.
 
 ### 4. Restoring Database Dumps
 When recovering a system that hosted databases, restore database dumps after base recovery, package installation, and service configuration are complete:
@@ -445,8 +561,8 @@ This helper will print the backup manifest, hardware classification, display exa
 Configure automated recurring backups by editing root's crontab (`doas crontab -e`):
 
 ```crontab
-# Bare-metal physical server: daily backup at 03:00 AM with /var/www, DB dumps, and SCP upload:
-0 3 * * * /usr/local/sbin/backup.ksh -p server -w -m --postgres -k 7 -d /var/backups -u backupuser@nas.lan:/storage/backups/ >/dev/null 2>&1
+# Bare-metal physical server: daily backup at 03:00 AM with signify signing, /var/www, DB dumps, and SCP upload:
+0 3 * * * /usr/local/sbin/backup.ksh -p server -S /etc/signify/backup.sec -w -m --postgres -k 7 -d /var/backups -u backupuser@nas.lan:/storage/backups/ >/dev/null 2>&1
 
 # Cloud VPS: daily backup at 02:30 AM with 7-day retention pushed offsite via SCP:
 30 2 * * * /usr/local/sbin/backup.ksh -p vps -w -k 7 -d /var/backups -u backupuser@nas.lan:/storage/vps-backups/ >/dev/null 2>&1
@@ -457,15 +573,15 @@ Configure automated recurring backups by editing root's crontab (`doas crontab -
 # Workstation Desktop: daily backup at 02:00 AM with GUI notification:
 0 2 * * * /usr/local/sbin/backup.ksh -p desktop -k 14 -d /var/backups -n >/dev/null 2>&1
 
-# Hourly lightweight configuration & dotfiles backup:
-0 * * * * /usr/local/sbin/backup.ksh -p config -k 24 -d /var/backups/config >/dev/null 2>&1
+# Hourly lightweight configuration & dotfiles backup (secrets excluded, chowned to user for sync):
+0 * * * * /usr/local/sbin/backup.ksh -p config --skip-secrets --chown -k 24 -d /var/backups/config >/dev/null 2>&1
 ```
 
 ---
 
 ## Testing & Verification
 
-An automated verification test suite is provided in [`tests/test_runner.sh`](tests/test_runner.sh). It validates shell syntax across `/bin/ksh` and `/bin/sh`, argument parsing, profile normalization/aliases, environment auto-detection heuristics against mocked platforms (bare-metal physical servers, desktop workstations, ThinkPad laptops, and QEMU/Vultr cloud VMs), native OpenBSD `tar -s` regex exclusions and live UNIX domain socket handling, and end-to-end archive verification and metadata inspection via [`restore.ksh`](restore.ksh).
+An automated verification test suite is provided in [`tests/test_runner.sh`](tests/test_runner.sh). It validates shell syntax across `/bin/ksh` and `/bin/sh`, argument parsing, profile normalization/aliases, environment auto-detection heuristics against mocked platforms (bare-metal physical servers, desktop workstations, ThinkPad laptops, and QEMU/Vultr cloud VMs), native OpenBSD `tar -s` regex exclusions, live UNIX domain socket handling, security hardening features (strict `umask 077` enforcement, delimiter collision safety, `--skip-secrets` credential isolation while retaining public keys, signify signature verification), and end-to-end archive verification and metadata inspection via [`restore.ksh`](restore.ksh).
 
 To run the test suite:
 

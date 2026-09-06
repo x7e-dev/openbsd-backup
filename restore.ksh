@@ -23,6 +23,9 @@
 
 set -e
 
+# Enforce strict permissions for all extraction and workspace operations (0700 dirs, 0600 files)
+umask 077
+
 PROGNAME="${0##*/}"
 
 usage() {
@@ -46,6 +49,9 @@ Modes (select one):
 
 Options:
   --dest DIR                   Target restore directory (default: /)
+  -S, --sig-key PUBKEY         Verify archive signature using OpenBSD signify(1) public key
+  -f, --force                  Bypass interactive confirmation and verification warnings
+      --no-backup              Do not create safety backup of /etc before restoring
   -n, --dry-run                Simulate restoration actions without modifying system
   -v, --verbose                Enable verbose extraction output
   -h, --help                   Display this help message and exit
@@ -84,6 +90,9 @@ TARGET_PATH=""
 RESTORE_DEST="/"
 DRY_RUN=0
 VERBOSE=0
+SIG_KEY=""
+FORCE=0
+NO_BACKUP=0
 
 # Parse options
 while [ $# -gt 0 ]; do
@@ -185,6 +194,23 @@ while [ $# -gt 0 ]; do
                 echo "Error: --dest requires a directory path." >&2
                 exit 1
             fi
+            ;;
+        -S|--sig-key)
+            if [[ -n "$2" && "$2" != -* ]] && [ -f "$2" ]; then
+                SIG_KEY="$2"
+                shift 2
+            else
+                echo "Error: --sig-key requires a valid public key file path." >&2
+                exit 1
+            fi
+            ;;
+        -f|--force)
+            FORCE=1
+            shift
+            ;;
+        --no-backup)
+            NO_BACKUP=1
+            shift
             ;;
         -n|--dry-run)
             DRY_RUN=1
@@ -305,6 +331,34 @@ verify_archive() {
         echo "Notice: No companion .sha256 file found. Skipping checksum comparison."
     fi
 
+    # Check for OpenBSD signify signature (.sig file or --sig-key)
+    SIG_FILE="${ARCHIVE}.sig"
+    if [ -z "$SIG_KEY" ] && [ -f "/etc/signify/backup.pub" ]; then
+        SIG_KEY="/etc/signify/backup.pub"
+    fi
+
+    if [ -n "$SIG_KEY" ] || [ -f "$SIG_FILE" ]; then
+        echo "Checking cryptographic signature (signify)..."
+        if [ ! -f "$SIG_FILE" ]; then
+            echo "Error: Archive signature file '${SIG_FILE}' not found!" >&2
+            return 1
+        fi
+        if [ -z "$SIG_KEY" ]; then
+            echo "Error: Signature file exists but no signify public key provided (use -S/--sig-key)." >&2
+            return 1
+        fi
+        if command -v signify >/dev/null 2>&1; then
+            if signify -V -p "$SIG_KEY" -m "$ARCHIVE" -x "$SIG_FILE" >/dev/null 2>&1; then
+                echo "Success: OpenBSD signify signature is valid."
+            else
+                echo "Error: OpenBSD signify signature verification failed!" >&2
+                return 1
+            fi
+        else
+            echo "Warning: signify command not found. Cannot verify signature." >&2
+        fi
+    fi
+
     # Test tar archive readability
     echo "Testing archive readability..."
     if tar ${TAR_TEST_FLAG} "${ARCHIVE}" >/dev/null 2>&1; then
@@ -322,15 +376,14 @@ show_info() {
     echo " Backup Archive Information: ${ARCHIVE##*/}"
     echo "============================================================"
     
-    # Extract _sysinfo files to temporary workspace
-    tar ${TAR_TEST_FLAG} "${ARCHIVE}" | grep -E '^(\./)?_sysinfo/' > "${TMP_WORKDIR}/sysinfo_list.txt" || true
+    # Extract _sysinfo files to temporary workspace safely
+    tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" _sysinfo 2>/dev/null || \
+    tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" ./_sysinfo 2>/dev/null || true
     
-    if [ -s "${TMP_WORKDIR}/sysinfo_list.txt" ]; then
-        # Extract sysinfo files
-        tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" $(cat "${TMP_WORKDIR}/sysinfo_list.txt") 2>/dev/null || true
-        SYSINFO="${TMP_WORKDIR}/_sysinfo"
-        [ -d "${TMP_WORKDIR}/./_sysinfo" ] && SYSINFO="${TMP_WORKDIR}/./_sysinfo"
+    SYSINFO="${TMP_WORKDIR}/_sysinfo"
+    [ -d "${TMP_WORKDIR}/./_sysinfo" ] && SYSINFO="${TMP_WORKDIR}/./_sysinfo"
 
+    if [ -d "$SYSINFO" ]; then
         if [ -f "${SYSINFO}/backup_manifest.txt" ]; then
             cat "${SYSINFO}/backup_manifest.txt"
             echo "------------------------------------------------------------"
@@ -543,7 +596,31 @@ enable_services() {
 # 7. EXTRACT CONFIG ONLY
 restore_config() {
     require_root
+
+    # Pre-restoration integrity and signature verification
+    if [ "$DRY_RUN" -eq 0 ]; then
+        verify_archive || return 1
+    fi
+
     echo "Restoring configurations and dotfiles to ${RESTORE_DEST}..."
+
+    # Confirmation prompt when modifying live system
+    if [ "$DRY_RUN" -eq 0 ] && [ "$FORCE" -eq 0 ] && [ -t 0 ]; then
+        echo -n "WARNING: This operation will overwrite configuration files in '${RESTORE_DEST}'. Proceed? [y/N]: "
+        read CONFIRM
+        case "$CONFIRM" in
+            [yY]|[yY][eE][sS]) ;;
+            *) echo "Restoration aborted by user." >&2; exit 1 ;;
+        esac
+    fi
+
+    # Create safety backup of /etc before overwriting live configurations
+    if [ "$DRY_RUN" -eq 0 ] && [ "$NO_BACKUP" -eq 0 ] && [ "$RESTORE_DEST" = "/" ] && [ -d "/etc" ]; then
+        mkdir -p /var/backups
+        ETC_BAK="/var/backups/etc.pre-restore.$(date '+%Y%m%d-%H%M%S').tar.gz"
+        echo "Creating pre-restore safety backup of live /etc to ${ETC_BAK}..."
+        tar -czf "$ETC_BAK" -C / etc 2>/dev/null || true
+    fi
     
     # Filter targets inside the archive that correspond to /etc, /root, and dotfiles
     tar ${TAR_TEST_FLAG} "${ARCHIVE}" > "${TMP_WORKDIR}/full_list.txt"
@@ -565,15 +642,50 @@ restore_config() {
         return 0
     fi
 
-    # Batch extraction using xargs to prevent ARG_MAX overflow with large numbers of dotfiles
-    xargs -n 200 tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${RESTORE_DEST}" < "${TMP_WORKDIR}/config_list.txt"
+    # Safe batch extraction avoiding xargs quote parsing and command-length overflow
+    set -A BATCH
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        set -A BATCH -- "${BATCH[@]}" "$line"
+        if [ ${#BATCH[@]} -ge 100 ]; then
+            tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${RESTORE_DEST}" "${BATCH[@]}"
+            set -A BATCH
+        fi
+    done < "${TMP_WORKDIR}/config_list.txt"
+    if [ ${#BATCH[@]} -gt 0 ]; then
+        tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${RESTORE_DEST}" "${BATCH[@]}"
+    fi
     echo "Configuration restore completed!"
 }
 
 # 8. FULL RESTORE
 restore_full() {
     require_root
+
+    # Pre-restoration integrity and signature verification
+    if [ "$DRY_RUN" -eq 0 ]; then
+        verify_archive || return 1
+    fi
+
     echo "Extracting complete backup archive to ${RESTORE_DEST}..."
+
+    # Confirmation prompt when modifying live system
+    if [ "$DRY_RUN" -eq 0 ] && [ "$FORCE" -eq 0 ] && [ -t 0 ]; then
+        echo -n "WARNING: This operation will overwrite all system files in '${RESTORE_DEST}'. Proceed? [y/N]: "
+        read CONFIRM
+        case "$CONFIRM" in
+            [yY]|[yY][eE][sS]) ;;
+            *) echo "Full restoration aborted by user." >&2; exit 1 ;;
+        esac
+    fi
+
+    # Create safety backup of /etc before full live extraction
+    if [ "$DRY_RUN" -eq 0 ] && [ "$NO_BACKUP" -eq 0 ] && [ "$RESTORE_DEST" = "/" ] && [ -d "/etc" ]; then
+        mkdir -p /var/backups
+        ETC_BAK="/var/backups/etc.pre-restore.$(date '+%Y%m%d-%H%M%S').tar.gz"
+        echo "Creating pre-restore safety backup of live /etc to ${ETC_BAK}..."
+        tar -czf "$ETC_BAK" -C / etc 2>/dev/null || true
+    fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "[Dry-Run] Would extract all files from ${ARCHIVE} to ${RESTORE_DEST}"

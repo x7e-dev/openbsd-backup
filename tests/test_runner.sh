@@ -77,7 +77,12 @@ assert_output_contains "backup.ksh --help contains desktop" "desktop: Desktop wo
 assert_output_contains "backup.ksh --help contains laptop" "laptop : Laptop/notebook" ksh "${REPO_DIR}/backup.ksh" --help
 assert_output_contains "backup.ksh --help contains vps" "vps    : Cloud VPS & VMs" ksh "${REPO_DIR}/backup.ksh" --help
 assert_output_contains "backup.ksh --help contains --force" "-f, --force" ksh "${REPO_DIR}/backup.ksh" --help
+assert_output_contains "backup.ksh --help contains --sign" "-S, --sign" ksh "${REPO_DIR}/backup.ksh" --help
+assert_output_contains "backup.ksh --help contains --skip-secrets" "--skip-secrets" ksh "${REPO_DIR}/backup.ksh" --help
+assert_output_contains "backup.ksh --help contains --chown" "--chown" ksh "${REPO_DIR}/backup.ksh" --help
 assert_output_contains "restore.ksh --help contains show-info" "--show-info" ksh "${REPO_DIR}/restore.ksh" --help
+assert_output_contains "restore.ksh --help contains --sig-key" "-S, --sig-key" ksh "${REPO_DIR}/restore.ksh" --help
+assert_output_contains "restore.ksh --help contains --force" "-f, --force" ksh "${REPO_DIR}/restore.ksh" --help
 
 # Test 3: Profile normalization and detection logic
 echo "3. Testing profile alias normalization and auto-detection..."
@@ -463,6 +468,87 @@ if echo "$ARCHIVE_CONTENT" | grep -qE '_backup_|\.tar\.gz|\.tmp|\.cargo/git|S\.g
     FAILED=$((FAILED + 1))
 else
     echo "  [PASS] Recursive backup archives, sockets, temp files, and caches properly excluded"
+    PASSED=$((PASSED + 1))
+fi
+
+# Test 6: Security hardening features
+echo "6. Testing security hardening features..."
+
+# 6.1 Umask 077 enforcement in restore.ksh
+if grep -qE '^umask 077' "${REPO_DIR}/restore.ksh"; then
+    echo "  [PASS] restore.ksh enforces strict umask (077)"
+    PASSED=$((PASSED + 1))
+else
+    echo "  [FAIL] restore.ksh did not declare strict umask 077"
+    FAILED=$((FAILED + 1))
+fi
+
+# 6.2 Comma delimiter handling in add_exclude_rule
+DELIM_TEST=$(ksh -c '
+set -A TAR_EXCLUDES
+add_exclude_rule() {
+    typeset pat="$1"
+    [ -z "$pat" ] && return 0
+    typeset delim=","
+    if [[ "$pat" == *","* ]]; then
+        delim="@"
+        if [[ "$pat" == *"@"* ]]; then
+            delim=":"
+        fi
+    fi
+    set -A TAR_EXCLUDES -- "${TAR_EXCLUDES[@]}" -s "${delim}${pat}${delim}${delim}"
+}
+add_exclude_rule "pattern,with,commas"
+echo "${TAR_EXCLUDES[0]}" "${TAR_EXCLUDES[1]}"
+')
+assert_output_contains "add_exclude_rule selects @ delimiter for comma patterns" "-s @pattern,with,commas@@" echo "$DELIM_TEST"
+
+# 6.3 Verify --skip-secrets excludes hashes and private keys but keeps public configs
+SECRETS_TEST_DIR="${TEST_TMP}/secrets_test"
+mkdir -p "${SECRETS_TEST_DIR}/etc/ssh"
+mkdir -p "${SECRETS_TEST_DIR}/etc/ssl/private"
+mkdir -p "${SECRETS_TEST_DIR}/home/user/.ssh"
+
+echo "root:*:0:0:daemon:/root:/bin/ksh" > "${SECRETS_TEST_DIR}/etc/passwd"
+echo "root:\$2b\$10\$hash:0:0:daemon:0:0:daemon:/root:/bin/ksh" > "${SECRETS_TEST_DIR}/etc/master.passwd"
+echo "PRIVATE_HOST_KEY" > "${SECRETS_TEST_DIR}/etc/ssh/ssh_host_ed25519_key"
+echo "ssh-ed25519 AAAAC3... host" > "${SECRETS_TEST_DIR}/etc/ssh/ssh_host_ed25519_key.pub"
+echo "TLS_KEY" > "${SECRETS_TEST_DIR}/etc/ssl/private/server.key"
+echo "USER_PRIVATE_KEY" > "${SECRETS_TEST_DIR}/home/user/.ssh/id_ed25519"
+echo "ssh-ed25519 AAAAC3... user" > "${SECRETS_TEST_DIR}/home/user/.ssh/id_ed25519.pub"
+echo "ssh-ed25519 AAAAC3... auth" > "${SECRETS_TEST_DIR}/home/user/.ssh/authorized_keys"
+
+SECRETS_ARCHIVE="${TEST_TMP}/secrets_archive.tar.gz"
+
+tar -czf "${SECRETS_ARCHIVE}" \
+    -s ',^etc/master\.passwd$,,' \
+    -s ',.*/etc/master\.passwd$,,' \
+    -s ',^etc/spwd\.db$,,' \
+    -s ',.*/etc/spwd\.db$,,' \
+    -s ',^etc/shadow$,,' \
+    -s ',.*/etc/shadow$,,' \
+    -s ',^etc/ssh/ssh_host_.*_key$,,' \
+    -s ',.*/etc/ssh/ssh_host_.*_key$,,' \
+    -s ',^etc/ssl/private/.*,,' \
+    -s ',^etc/ssl/private$,,' \
+    -s ',.*/etc/ssl/private/.*,,' \
+    -s ',.*/etc/ssl/private$,,' \
+    -s ',.*\.ssh/id_.*,,' \
+    -C "${SECRETS_TEST_DIR}" etc home
+
+SECRETS_CONTENT=$(tar -tzf "${SECRETS_ARCHIVE}")
+
+assert_output_contains "--skip-secrets preserves /etc/passwd" "etc/passwd" echo "$SECRETS_CONTENT"
+assert_output_contains "--skip-secrets preserves SSH host public key" "etc/ssh/ssh_host_ed25519_key.pub" echo "$SECRETS_CONTENT"
+assert_output_contains "--skip-secrets preserves authorized_keys" "home/user/.ssh/authorized_keys" echo "$SECRETS_CONTENT"
+
+if echo "$SECRETS_CONTENT" | grep -qE 'master\.passwd|ssh_host_ed25519_key$|private/server\.key|id_ed25519$'; then
+    echo "  [FAIL] Sensitive files were not excluded by --skip-secrets rules!"
+    echo "  Archive contents:"
+    echo "$SECRETS_CONTENT"
+    FAILED=$((FAILED + 1))
+else
+    echo "  [PASS] Sensitive files (master.passwd, host keys, TLS keys, user id keys) properly excluded"
     PASSED=$((PASSED + 1))
 fi
 
