@@ -45,37 +45,38 @@ Engineered with specialized support for:
 ## Key Highlights
 
 - **Unified Multi-Platform Engine:** A single, maintainable backup script ([`backup.ksh`](backup.ksh)) with intelligent multi-factor hardware auto-detection across baremetal servers, desktops, laptops, and cloud VPS instances.
-- **Turnkey Disaster Recovery:** A dedicated restoration engine ([`restore.ksh`](restore.ksh)) featuring SHA256 verification, pre-apply unified diffing (`--diff`), dry-run simulations (`--dry-run`), and full bare-metal rebuilding (`--all`).
+- **Turnkey Disaster Recovery:** A dedicated restoration engine ([`restore.ksh`](restore.ksh)) featuring SHA256 verification, pre-apply unified diffing (`--diff`), dry-run simulations (`--dry-run`), resilient non-fatal warning tolerance, and full bare-metal rebuilding (`--all`) with backward-compatible support for legacy archive metadata.
 - **Autonomous Emergency Helper:** Every archive embeds an executable `_sysinfo/quick-restore.sh` helper, enabling guided disaster recovery even if `restore.ksh` is not present on the rescue media.
 - **Bare-Metal Storage & Hardware Metadata:** Automatically preserves DUIDs, active mount points (`fstab`), per-disk `fdisk` geometries, `disklabel` slice allocations, encrypted softraid / hardware RAID (`bioctl`) volume mappings, sensors, and bootloader settings (`boot.conf`).
 - **Form-Factor & Partition Safeguards:**
   - **Direct-to-Destination Staging:** Stages temporary archives directly in the target destination filesystem rather than `/tmp`, bypassing OpenBSD's small (500MB–1GB) `/tmp` slice and avoiding cross-device copy overhead.
   - **Root Slice Space Guard:** Automatically detects if the destination is on the root filesystem (`/`) and warns the user to prevent filling OpenBSD's typically small (1–2GB) `/` slice.
-  - **Strict Recursion & Loop Prevention:** Always excludes prior backups (`*_backup_*.tar.*`, `*.tar.gz`, `*.tar.xz`), temporary staging files, and foreign/network mountpoints (NFS, FUSE/sshfs, mfs) to avoid self-ingestion and exponential archive growth.
+  - **Strict Recursion & Loop Prevention:** Always excludes prior backups (`*_backup_*.tar.*`, `*.tar.gz`, `*.tar.xz`), temporary staging files, and foreign/network mountpoints (NFS, FUSE/sshfs, mfs, tmpfs, smbfs) to avoid self-ingestion and exponential archive growth.
   - **Native OpenBSD tar(1) Compatibility:** Leverages OpenBSD `tar(1)` / `pax(1)` native `-s replstr` regular expression pattern substitution (`-s ',pattern,,'`) instead of unsupported GNU `--exclude` flags, guaranteeing 100% stock base OpenBSD compatibility without external packages (`gtar`).
   - **UNIX Domain Socket Exclusions:** Proactively skips active IPC sockets (`.gnupg/S.*`, `*.sock`, `*.socket`), preventing OpenBSD `ustar` archiving errors and socket corruption.
   - **Laptop Battery Protection:** Pre-flight battery check warns or prevents running heavy compression operations on low battery (≤ 20%) to avoid sudden shutdown.
-  - **Adaptive Multi-Core XZ Compression:** Uses multi-threaded compression (`-T0`) on systems with > 1GB RAM, while restricting XZ dictionary memory on low-memory VPS instances (≤ 1GB RAM) to prevent kernel OOM killer panics.
+  - **Adaptive Multi-Core XZ Compression:** Uses multi-threaded compression (`-T0`) on systems with > 1GB RAM, while restricting XZ dictionary memory on low-memory VPS instances (≤ 1GB RAM via `hw.physmem64`) to prevent kernel OOM killer panics.
 - **Hardened Security by Default:**
   - Enforces `umask 077` throughout both `backup.ksh` and `restore.ksh` (`0600` archive / `0700` working directories), guaranteeing sensitive data (such as `/etc/master.passwd`, SSH host keys, WireGuard keys, and database dumps) is never world-readable.
   - **Cryptographic Signatures (`signify`):** Native OpenBSD `signify(1)` archive signing (`-S / --sign`) and verification (`--sig-key`), ensuring authenticity and tamper prevention.
   - **Secrets Isolation (`--skip-secrets`):** Safely excludes password hashes, private host/user keys, and databases for untrusted destinations or environment sync; enabled by default on the `config` profile.
   - **Strict Archive Ownership:** Backups containing system secrets retain `root:wheel` (`0600`) ownership to prevent privilege leakage to non-root users (`--chown` permits transfer when secrets are excluded).
-  - **Live Restoration Guardrails:** `restore.ksh` creates an automatic `/var/backups/etc.pre-restore.<timestamp>.tar.gz` safety snapshot and prompts for confirmation before overwriting live configurations.
+  - **Live Restoration Guardrails:** `restore.ksh` creates an automatic `/var/backups/etc.pre-restore.<timestamp>.tar.gz` safety snapshot, isolates metadata from polluting the destination root, and prompts for confirmation before overwriting live configurations.
 - **Production-Grade Reliability:**
   - File locking (`/var/run/openbsd-backup.lock`) with active PID detection to prevent overlapping cron runs.
   - Pre-flight storage checks (`df -k`) on scratch and target directories with fail-safe aborts to prevent filesystem exhaustion.
-  - Streaming database compression (`.sql.gz`) to preserve scratch storage.
+  - Streaming database compression (`.sql.gz`) with PATH-independent daemon discovery.
+  - Defensive target assembly checking filesystem directory existence before archiving.
   - Proactive UNIX domain socket filtering with post-creation integrity validation (`tar -tzf` / `-tJf`).
   - True atomic archive deployment (same-filesystem instantaneous rename).
-  - Automated retention pruning (`--keep N`) for archives, companion `.sha256`, and `.sig` files.
+  - Automated retention pruning (`--keep N`) filtering actual archive files and cleaning companion `.sha256` and `.sig` files without count drift.
   - Offsite SCP upload with safe shell-escaped parameter handling (`su -l "$DOAS_USER"`).
 
 ---
 
 ## Architecture & Archive Anatomy
 
-Each generated archive contains standard root-relative filesystem targets alongside an embedded `_sysinfo/` metadata directory capturing full operational state:
+Each generated archive contains standard root-relative filesystem targets alongside an embedded `_sysinfo/` metadata directory capturing full operational state (with [`restore.ksh`](restore.ksh) providing seamless backward compatibility for older archives using legacy `openbsd_sysinfo.XXXXXXXXXX` metadata folders):
 
 ```
 archive.tar.gz (or .tar.xz)
@@ -321,6 +322,9 @@ Restoring configuration or system files onto a running production machine carrie
    ```
    Pass `-f` / `--force` to bypass this prompt for unattended automation and recovery scripts.
 
+4. **Metadata Directory Isolation:**
+   When running full extractions (`--full` or `--all`), `restore.ksh` automatically isolates the embedded `_sysinfo/` directory (as well as legacy `openbsd_sysinfo.*` metadata directories) using OpenBSD `tar -s` exclusions to ensure operational logs, manifest files, and recreation scripts do not pollute the destination root filesystem (`/`).
+
 ---
 
 ## Privilege & Permissions Matrix
@@ -445,7 +449,7 @@ To prevent accidental recursion, exponential archive expansion, socket errors, a
 - **Temporary Staging Files:** `.*/\..*\.tmp\..*`, `.*\.tmp\.[0-9]*`
 - **UNIX Domain Sockets:** `.*\.gnupg/S\..*`, `.*\.sock$`, `.*\.socket$` (OpenBSD `ustar` format cannot archive dynamic IPC sockets)
 - **Target Destination Files:** Automatically excludes destination archives, checksums, and signatures when writing inside backed-up directories (e.g., `/var/backups`, `/home`, `/root`)
-- **Foreign & Network Mounts:** Automatically parses active mount points to exclude foreign filesystems (`nfs`, `fuse`/sshfs, `mfs`) mounted under target directories
+- **Foreign & Network Mounts:** Automatically parses active mount points to exclude foreign and virtual filesystems (`nfs`, `fuse`, `fusefs`/sshfs, `mfs`, `tmpfs`, `smbfs`) mounted under target directories
 
 > [!TIP]
 > **Delimiter Collision Safety:** When custom or built-in exclusion patterns contain commas (e.g. `pattern,with,commas`), `backup.ksh` dynamically switches the substitution delimiter from `,` to `@` or `:` (e.g., `-s '@pattern@@'`), preventing pattern corruption or tar syntax errors.
@@ -581,7 +585,7 @@ Configure automated recurring backups by editing root's crontab (`doas crontab -
 
 ## Testing & Verification
 
-An automated verification test suite is provided in [`tests/test_runner.sh`](tests/test_runner.sh). It validates shell syntax across `/bin/ksh` and `/bin/sh`, argument parsing, profile normalization/aliases, environment auto-detection heuristics against mocked platforms (bare-metal physical servers, desktop workstations, ThinkPad laptops, and QEMU/Vultr cloud VMs), native OpenBSD `tar -s` regex exclusions, live UNIX domain socket handling, security hardening features (strict `umask 077` enforcement, delimiter collision safety, `--skip-secrets` credential isolation while retaining public keys, signify signature verification), and end-to-end archive verification and metadata inspection via [`restore.ksh`](restore.ksh).
+An automated verification test suite containing 48 comprehensive assertions is provided in [`tests/test_runner.sh`](tests/test_runner.sh). It validates shell syntax across `/bin/ksh` and `/bin/sh`, argument parsing, profile normalization/aliases, environment auto-detection heuristics against mocked platforms (bare-metal physical servers, desktop workstations, ThinkPad laptops, and QEMU/Vultr cloud VMs), 64-bit memory detection (`hw.physmem64`), native OpenBSD `tar -s` regex exclusions, live UNIX domain socket handling, security hardening features (strict `umask 077` enforcement, delimiter collision safety, `--skip-secrets` credential isolation while retaining public keys, signify signature verification), retention policy archive counting and companion pruning, backward-compatible restoration from legacy metadata formats (`openbsd_sysinfo.*`), full restore root metadata isolation, and end-to-end archive verification and inspection via [`restore.ksh`](restore.ksh).
 
 To run the test suite:
 

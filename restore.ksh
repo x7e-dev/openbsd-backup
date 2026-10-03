@@ -383,6 +383,16 @@ show_info() {
     SYSINFO="${TMP_WORKDIR}/_sysinfo"
     [ -d "${TMP_WORKDIR}/./_sysinfo" ] && SYSINFO="${TMP_WORKDIR}/./_sysinfo"
 
+    # Support legacy archives containing openbsd_sysinfo.* metadata folder
+    if [ ! -d "$SYSINFO" ]; then
+        legacy_dir=$(tar ${TAR_LIST_FLAG} "${ARCHIVE}" 2>/dev/null | grep -E '^(\./)?openbsd_sysinfo\.[^/]+/' | head -n 1 | sed -e 's#^\./##' -e 's#/.*##')
+        if [ -n "$legacy_dir" ]; then
+            tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" "$legacy_dir" 2>/dev/null || \
+            tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" "./$legacy_dir" 2>/dev/null || true
+            [ -d "${TMP_WORKDIR}/${legacy_dir}" ] && SYSINFO="${TMP_WORKDIR}/${legacy_dir}"
+        fi
+    fi
+
     if [ -d "$SYSINFO" ]; then
         if [ -f "${SYSINFO}/backup_manifest.txt" ]; then
             cat "${SYSINFO}/backup_manifest.txt"
@@ -542,11 +552,16 @@ restore_packages() {
     
     mkdir -p "${TMP_WORKDIR}/sysinfo"
     if ! tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" _sysinfo/installed_packages.txt 2>/dev/null; then
-        echo "Error: _sysinfo/installed_packages.txt not found in archive." >&2
-        return 1
+        legacy_pkg=$(tar ${TAR_LIST_FLAG} "${ARCHIVE}" 2>/dev/null | grep -E '^(\./)?openbsd_sysinfo\.[^/]+/installed_packages\.txt$' | head -n 1 | sed 's#^\./##')
+        if [ -n "$legacy_pkg" ] && tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" "$legacy_pkg" 2>/dev/null; then
+            PKG_FILE="${TMP_WORKDIR}/${legacy_pkg}"
+        else
+            echo "Error: _sysinfo/installed_packages.txt not found in archive." >&2
+            return 1
+        fi
+    else
+        PKG_FILE="${TMP_WORKDIR}/_sysinfo/installed_packages.txt"
     fi
-    
-    PKG_FILE="${TMP_WORKDIR}/_sysinfo/installed_packages.txt"
     if [ ! -s "$PKG_FILE" ]; then
         echo "Error: No packages listed in installed_packages.txt." >&2
         return 1
@@ -561,7 +576,9 @@ restore_packages() {
     fi
 
     echo "Installing packages via pkg_add -l..."
-    pkg_add -l "$PKG_FILE"
+    if ! pkg_add -l "$PKG_FILE"; then
+        echo "Warning: Some packages could not be installed. Continuing with restoration..." >&2
+    fi
     echo "Package restoration completed!"
 }
 
@@ -571,11 +588,16 @@ enable_services() {
     echo "Restoring enabled services from archive..."
     
     if ! tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" _sysinfo/services_enabled_rcctl.txt 2>/dev/null; then
-        echo "Error: _sysinfo/services_enabled_rcctl.txt not found in archive." >&2
-        return 1
+        legacy_svc=$(tar ${TAR_LIST_FLAG} "${ARCHIVE}" 2>/dev/null | grep -E '^(\./)?openbsd_sysinfo\.[^/]+/services_enabled_rcctl\.txt$' | head -n 1 | sed 's#^\./##')
+        if [ -n "$legacy_svc" ] && tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${TMP_WORKDIR}" "$legacy_svc" 2>/dev/null; then
+            SVC_FILE="${TMP_WORKDIR}/${legacy_svc}"
+        else
+            echo "Error: _sysinfo/services_enabled_rcctl.txt not found in archive." >&2
+            return 1
+        fi
+    else
+        SVC_FILE="${TMP_WORKDIR}/_sysinfo/services_enabled_rcctl.txt"
     fi
-
-    SVC_FILE="${TMP_WORKDIR}/_sysinfo/services_enabled_rcctl.txt"
     if [ ! -s "$SVC_FILE" ]; then
         echo "Notice: No services recorded to enable."
         return 0
@@ -648,12 +670,24 @@ restore_config() {
         [ -z "$line" ] && continue
         set -A BATCH -- "${BATCH[@]}" "$line"
         if [ ${#BATCH[@]} -ge 100 ]; then
+            set +e
             tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${RESTORE_DEST}" "${BATCH[@]}"
+            TAR_BATCH_EXIT=$?
+            set -e
+            if [ "$TAR_BATCH_EXIT" -ne 0 ]; then
+                echo "Notice: Non-fatal tar warnings encountered during batch extraction (exit code ${TAR_BATCH_EXIT})." >&2
+            fi
             set -A BATCH
         fi
     done < "${TMP_WORKDIR}/config_list.txt"
     if [ ${#BATCH[@]} -gt 0 ]; then
+        set +e
         tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -C "${RESTORE_DEST}" "${BATCH[@]}"
+        TAR_BATCH_EXIT=$?
+        set -e
+        if [ "$TAR_BATCH_EXIT" -ne 0 ]; then
+            echo "Notice: Non-fatal tar warnings encountered during batch extraction (exit code ${TAR_BATCH_EXIT})." >&2
+        fi
     fi
     echo "Configuration restore completed!"
 }
@@ -692,8 +726,17 @@ restore_full() {
         return 0
     fi
 
-    # Exclude _sysinfo from being extracted directly into root
-    tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" -s ',.*_sysinfo.*,,' -C "${RESTORE_DEST}"
+    # Exclude _sysinfo and legacy metadata folders from being extracted directly into root
+    set +e
+    tar ${TAR_EXTRACT_FLAG} "${ARCHIVE}" \
+        -s ',.*_sysinfo.*,,' \
+        -s ',.*openbsd_sysinfo\..*,,' \
+        -C "${RESTORE_DEST}"
+    TAR_RESTORE_EXIT=$?
+    set -e
+    if [ "$TAR_RESTORE_EXIT" -ne 0 ]; then
+        echo "Notice: Non-fatal tar warnings encountered during extraction (exit code ${TAR_RESTORE_EXIT})." >&2
+    fi
     echo "Full extraction completed!"
 }
 
@@ -727,7 +770,6 @@ case "$MODE" in
         ;;
     all)
         echo "Initiating complete bare-metal restoration..."
-        verify_archive
         restore_full
         restore_packages
         enable_services

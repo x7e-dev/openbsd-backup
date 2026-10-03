@@ -45,6 +45,10 @@ PROGNAME="${0##*/}"
 LOCK_DIR="/var/run/openbsd-backup.lock"
 HOSTNAME=$(hostname)
 TIMESTAMP=$(date '+%Y.%m.%d-%H.%M.%S')
+SYSINFO_STAGE_DIR=""
+SYSINFO_DIR=""
+TAR_ERR_FILE=""
+TMP_BACKUP_FILE=""
 
 usage() {
     cat <<EOF
@@ -134,7 +138,11 @@ echo "$$" > "${LOCK_DIR}/pid"
 # Cleanup trap for lock directory and temporary files
 cleanup() {
     EXIT_CODE=$?
-    rm -rf "${LOCK_DIR}" "${SYSINFO_DIR}" "${TAR_ERR_FILE}" "${TMP_BACKUP_FILE}" 2>/dev/null || true
+    [ -n "${LOCK_DIR}" ] && rm -rf "${LOCK_DIR}" 2>/dev/null || true
+    [ -n "${SYSINFO_STAGE_DIR}" ] && rm -rf "${SYSINFO_STAGE_DIR}" 2>/dev/null || true
+    [ -n "${SYSINFO_DIR}" ] && rm -rf "${SYSINFO_DIR}" 2>/dev/null || true
+    [ -n "${TAR_ERR_FILE}" ] && rm -f "${TAR_ERR_FILE}" 2>/dev/null || true
+    [ -n "${TMP_BACKUP_FILE}" ] && rm -f "${TMP_BACKUP_FILE}" 2>/dev/null || true
     exit $EXIT_CODE
 }
 trap cleanup EXIT INT TERM QUIT
@@ -426,7 +434,7 @@ detect_environment() {
     else
         DETECTED_ENV="server"
         SERVER_DESC="${HW_VENDOR} ${HW_PRODUCT}"
-        [ -z "${SERVER_DESC// /}" ] && SERVER_DESC="Generic Physical Hardware"
+        [ -z "$(echo "$SERVER_DESC" | tr -d ' ')" ] && SERVER_DESC="Generic Physical Hardware"
         DETECTED_DETAIL="Bare-metal Physical Server (${SERVER_DESC})"
     fi
 }
@@ -545,7 +553,7 @@ if [ "$USE_XZ" -eq 1 ]; then
     TEST_FLAG="-tJf"
 
     # In low-memory environments (e.g. VPS with <= 1GB RAM), bound XZ memory
-    PHYSMEM_BYTES=$(sysctl -n hw.physmem 2>/dev/null || echo 0)
+    PHYSMEM_BYTES=$(sysctl -n hw.physmem64 2>/dev/null || sysctl -n hw.physmem 2>/dev/null || echo 0)
     if [ "$PHYSMEM_BYTES" -gt 0 ] && [ "$PHYSMEM_BYTES" -le 1073741824 ]; then
         export XZ_OPT="${XZ_OPT:--T1 -M 256M}"
         echo "Notice: Low memory detected ($((PHYSMEM_BYTES / 1048576))MB). Restricting XZ: ${XZ_OPT}."
@@ -599,18 +607,21 @@ check_disk_space "${SCRATCH_DIR}" 100
 # Prevents exhausting small OpenBSD /tmp (500MB-1GB) or /var/tmp partitions,
 # and enables instantaneous atomic rename without cross-device data copying.
 TMP_BACKUP_FILE=$(mktemp "${FINAL_DEST_DIR}/.${ARCHIVE_BASENAME}.tmp.XXXXXXXXXX")
-SYSINFO_DIR=$(mktemp -d "${SCRATCH_DIR}/openbsd_sysinfo.XXXXXXXXXX")
+SYSINFO_STAGE_DIR=$(mktemp -d "${SCRATCH_DIR}/openbsd_sysinfo.XXXXXXXXXX")
+SYSINFO_DIR="${SYSINFO_STAGE_DIR}/_sysinfo"
+mkdir -m 700 "${SYSINFO_DIR}"
 TAR_ERR_FILE=$(mktemp "${SCRATCH_DIR}/openbsd_tar_err.XXXXXXXXXX")
 
 # ==============================================================================
 # 1. Target Directory Assembly
 # ==============================================================================
 
-# Core base targets for all profiles
-set -A TARGETS etc root usr/local/bin usr/local/sbin var/cron/tabs var/backups
-
-# Add optional system directories if present
-[ -d "/var/cron/atjobs" ] && set -A TARGETS -- "${TARGETS[@]}" var/cron/atjobs
+# Core base targets for all profiles (verified to exist on filesystem)
+set -A BASE_TARGETS etc root usr/local/bin usr/local/sbin var/cron/tabs var/backups var/cron/atjobs
+set -A TARGETS
+for b_tgt in "${BASE_TARGETS[@]}"; do
+    [ -d "/${b_tgt}" ] && set -A TARGETS -- "${TARGETS[@]}" "$b_tgt"
+done
 
 if [ "$PROFILE" = "config" ]; then
     echo "Mode: Configuration & Dotfile backup (fast disaster recovery)"
@@ -804,8 +815,8 @@ if [ -n "$FINAL_DEST_DIR" ]; then
     fi
 fi
 
-# Exclude foreign / network filesystem mountpoints (NFS, sshfs, mfs) under target directories
-for mnt_entry in $(mount 2>/dev/null | awk '$5 ~ /^(nfs|fuse|mfs)$/ {print $3}'); do
+# Exclude foreign / network filesystem mountpoints (NFS, sshfs, mfs, tmpfs) under target directories
+for mnt_entry in $(mount 2>/dev/null | awk '$5 ~ /^(nfs|fuse|fusefs|mfs|tmpfs|smbfs)$/ {print $3}'); do
     rel_mnt="${mnt_entry#/}"
     if [ -n "$rel_mnt" ]; then
         add_exclude_rule ".*${rel_mnt}/.*"
@@ -853,8 +864,10 @@ done
 
 if [ -n "$EXCLUDE_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
-        [ -z "$line" ] || [[ "$line" == \#* ]] && continue
-        add_user_exclude "$line"
+        case "$line" in
+            ""|\#*) continue ;;
+            *) add_user_exclude "$line" ;;
+        esac
     done < "$EXCLUDE_FILE"
 fi
 
@@ -894,8 +907,10 @@ fi
 
 if [ "$BACKUP_POSTGRES" -eq 1 ]; then
     echo "Capturing PostgreSQL database dump (compressed)..."
-    if command -v pg_dumpall >/dev/null 2>&1; then
-        if su -l _postgresql -c "pg_dumpall" 2>/dev/null \
+    PG_DUMPALL=$(command -v pg_dumpall 2>/dev/null || true)
+    [ -z "$PG_DUMPALL" ] && [ -x "/usr/local/bin/pg_dumpall" ] && PG_DUMPALL="/usr/local/bin/pg_dumpall"
+    if [ -n "$PG_DUMPALL" ]; then
+        if su -l _postgresql -c "${PG_DUMPALL}" 2>/dev/null \
             | gzip -c > "${SYSINFO_DIR}/postgresql_all_databases.sql.gz"; then
             gz_bytes=$(wc -c < "${SYSINFO_DIR}/postgresql_all_databases.sql.gz" 2>/dev/null || echo 0)
             if [ "$gz_bytes" -lt 50 ]; then
@@ -938,7 +953,7 @@ Version        : $(sysctl -n hw.version 2>/dev/null || echo "Unknown")
 UUID           : $(sysctl -n hw.uuid 2>/dev/null || echo "Unknown")
 CPU Model      : $(sysctl -n hw.model 2>/dev/null || echo "Unknown")
 CPU Cores      : $(sysctl -n hw.ncpusfound 2>/dev/null || echo "Unknown") (online: $(sysctl -n hw.ncpus 2>/dev/null || echo "Unknown"))
-Physical RAM   : $(( $(sysctl -n hw.physmem 2>/dev/null || echo 0) / 1048576 )) MB
+Physical RAM   : $(( $(sysctl -n hw.physmem64 2>/dev/null || sysctl -n hw.physmem 2>/dev/null || echo 0) / 1048576 )) MB
 Disks (hw)     : $(sysctl -n hw.disknames 2>/dev/null || echo "Unknown")
 HWEOF
 
@@ -1216,7 +1231,7 @@ set +e
 nice -n 15 tar "${TAR_OPTS}" "${TMP_BACKUP_FILE}" \
     "${TAR_EXCLUDES[@]}" \
     -C / "${TARGETS[@]}" \
-    -C "${SYSINFO_DIR}/.." "${SYSINFO_DIR##*/}" \
+    -C "${SYSINFO_STAGE_DIR}" _sysinfo \
     2> "${TAR_ERR_FILE}"
 TAR_EXIT=$?
 set -e
@@ -1283,12 +1298,16 @@ if [ "$KEEP_COUNT" -gt 0 ]; then
     echo "Applying retention policy (keeping last ${KEEP_COUNT} backups)..."
     ARCHIVE_PREFIX="${HOSTNAME}_${PROFILE}_backup_"
     
-    # List backups in chronological order (oldest first), safely handling paths with spaces
+    # List actual archives only (.tar.gz, .tar.xz, .tgz) in chronological order (oldest first)
     set -A EXISTING_BACKUPS
     while IFS= read -r f || [ -n "$f" ]; do
-        [ -f "$f" ] && set -A EXISTING_BACKUPS -- "${EXISTING_BACKUPS[@]}" "$f"
+        case "$f" in
+            *.tar.gz|*.tar.xz|*.tgz)
+                [ -f "$f" ] && set -A EXISTING_BACKUPS -- "${EXISTING_BACKUPS[@]}" "$f"
+                ;;
+        esac
     done <<EOF
-$(ls -1tr "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tar.* 2>/dev/null || true)
+$(ls -1tr "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tar.gz "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tar.xz "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tgz 2>/dev/null || true)
 EOF
 
     TOTAL_COUNT=${#EXISTING_BACKUPS[@]}

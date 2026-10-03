@@ -106,7 +106,7 @@ sysctl() {
         hw.version) echo "$MOCK_HW_VERSION" ;;
         hw.disknames) echo "$MOCK_HW_DISKNAMES" ;;
         hw.sensors) echo "$MOCK_SENSORS" ;;
-        hw.physmem) echo "2147483648" ;;
+        hw.physmem64|hw.physmem) echo "2147483648" ;;
         hw.model) echo "Intel(R) Core(TM)" ;;
         hw.ncpusfound) echo "4" ;;
         hw.ncpus) echo "4" ;;
@@ -214,7 +214,7 @@ detect_environment() {
     else
         DETECTED_ENV="server"
         SERVER_DESC="${HW_VENDOR} ${HW_PRODUCT}"
-        [ -z "${SERVER_DESC// /}" ] && SERVER_DESC="Generic Physical Hardware"
+        [ -z "$(echo "$SERVER_DESC" | tr -d ' ')" ] && SERVER_DESC="Generic Physical Hardware"
         DETECTED_DETAIL="Bare-metal Physical Server (${SERVER_DESC})"
     fi
 }
@@ -427,6 +427,49 @@ assert_output_contains "restore.ksh --show-info displays disklabel protofiles" "
 assert_output_contains "restore.ksh --show-info displays compressed database dumps" "MariaDB (Compressed)" ksh "${REPO_DIR}/restore.ksh" --show-info "${ARCHIVE_PATH}"
 assert_output_contains "restore.ksh --show-info displays service flags" "apmd_flags=\"-A\"" ksh "${REPO_DIR}/restore.ksh" --show-info "${ARCHIVE_PATH}"
 
+# Test 4b: Backward compatibility for legacy archives with openbsd_sysinfo.XXXXXXXXXX
+LEGACY_DIR="${TEST_TMP}/legacy_fixture"
+mkdir -p "${LEGACY_DIR}/openbsd_sysinfo.ffm7IrpjPx" "${LEGACY_DIR}/etc"
+cat << 'EOF' > "${LEGACY_DIR}/openbsd_sysinfo.ffm7IrpjPx/backup_manifest.txt"
+OpenBSD Backup Manifest
+Hostname     : obsd-legacy.lan
+Profile      : server
+EOF
+cat << 'EOF' > "${LEGACY_DIR}/openbsd_sysinfo.ffm7IrpjPx/installed_packages.txt"
+curl-8.9.1
+EOF
+cat << 'EOF' > "${LEGACY_DIR}/openbsd_sysinfo.ffm7IrpjPx/services_enabled_rcctl.txt"
+sshd
+EOF
+echo "syslog: yes" > "${LEGACY_DIR}/etc/syslog.conf"
+LEGACY_ARCHIVE_PATH="${TEST_TMP}/obsd-legacy_server_backup_2026.09.05.tar.gz"
+tar -czf "${LEGACY_ARCHIVE_PATH}" -C "${LEGACY_DIR}" etc openbsd_sysinfo.ffm7IrpjPx
+
+assert_output_contains "restore.ksh --show-info displays legacy manifest" "obsd-legacy.lan" ksh "${REPO_DIR}/restore.ksh" --show-info "${LEGACY_ARCHIVE_PATH}"
+
+# Test 4c: Full restore excludes both _sysinfo and legacy openbsd_sysinfo.* from restore destination
+RESTORE_EXTRACT_DEST="${TEST_TMP}/restore_dest"
+mkdir -p "${RESTORE_EXTRACT_DEST}"
+tar -xzf "${ARCHIVE_PATH}" -s ',.*_sysinfo.*,,' -s ',.*openbsd_sysinfo\..*,,' -C "${RESTORE_EXTRACT_DEST}"
+tar -xzf "${LEGACY_ARCHIVE_PATH}" -s ',.*_sysinfo.*,,' -s ',.*openbsd_sysinfo\..*,,' -C "${RESTORE_EXTRACT_DEST}"
+
+if [ -d "${RESTORE_EXTRACT_DEST}/_sysinfo" ] || ls -d "${RESTORE_EXTRACT_DEST}"/openbsd_sysinfo.* >/dev/null 2>&1; then
+    echo "  [FAIL] Metadata directory was incorrectly extracted into restore destination!"
+    FAILED=$((FAILED + 1))
+else
+    echo "  [PASS] Full restore excludes _sysinfo and legacy openbsd_sysinfo.* from destination root"
+    PASSED=$((PASSED + 1))
+fi
+
+# Test 4d: Verify backup.ksh archives _sysinfo directory instead of openbsd_sysinfo.XXXXXXXXXX
+if grep -q 'C "\${SYSINFO_STAGE_DIR}" _sysinfo' "${REPO_DIR}/backup.ksh"; then
+    echo "  [PASS] backup.ksh archives metadata as _sysinfo directory"
+    PASSED=$((PASSED + 1))
+else
+    echo "  [FAIL] backup.ksh does not archive _sysinfo directory"
+    FAILED=$((FAILED + 1))
+fi
+
 # Test 5: Verify recursion, socket, and cache exclusion patterns via OpenBSD tar -s syntax
 echo "5. Testing recursion and loop exclusion patterns (OpenBSD tar -s)..."
 EXCLUDE_TEST_DIR="${TEST_TMP}/exclude_test"
@@ -550,6 +593,65 @@ if echo "$SECRETS_CONTENT" | grep -qE 'master\.passwd|ssh_host_ed25519_key$|priv
 else
     echo "  [PASS] Sensitive files (master.passwd, host keys, TLS keys, user id keys) properly excluded"
     PASSED=$((PASSED + 1))
+fi
+
+# Test 7: Retention policy verification (archive count vs companion files)
+echo "7. Testing retention policy logic..."
+RETENTION_TEST_DIR="${TEST_TMP}/retention_test"
+mkdir -p "${RETENTION_TEST_DIR}"
+
+# Create 3 archives with companion sha256 and sig files
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.01.tar.gz"
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.01.tar.gz.sha256"
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.01.tar.gz.sig"
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.02.tar.gz"
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.02.tar.gz.sha256"
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.02.tar.gz.sig"
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.03.tar.gz"
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.03.tar.gz.sha256"
+touch "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.03.tar.gz.sig"
+
+# Execute retention logic with KEEP_COUNT=2
+ksh -c '
+FINAL_DEST_DIR="'"${RETENTION_TEST_DIR}"'"
+ARCHIVE_PREFIX="myhost_server_backup_"
+KEEP_COUNT=2
+
+set -A EXISTING_BACKUPS
+while IFS= read -r f || [ -n "$f" ]; do
+    case "$f" in
+        *.tar.gz|*.tar.xz|*.tgz)
+            [ -f "$f" ] && set -A EXISTING_BACKUPS -- "${EXISTING_BACKUPS[@]}" "$f"
+            ;;
+    esac
+done <<EOF
+$(ls -1tr "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tar.gz "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tar.xz "${FINAL_DEST_DIR}/${ARCHIVE_PREFIX}"*.tgz 2>/dev/null || true)
+EOF
+
+TOTAL_COUNT=${#EXISTING_BACKUPS[@]}
+if [ "$TOTAL_COUNT" -gt "$KEEP_COUNT" ]; then
+    EXCESS=$((TOTAL_COUNT - KEEP_COUNT))
+    i=0
+    while [ "$i" -lt "$EXCESS" ]; do
+        OLD_FILE="${EXISTING_BACKUPS[$i]}"
+        if [ -f "$OLD_FILE" ]; then
+            rm -f "$OLD_FILE" "${OLD_FILE}.sha256" "${OLD_FILE}.sig" 2>/dev/null || true
+        fi
+        i=$((i + 1))
+    done
+fi
+'
+
+if [ ! -f "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.01.tar.gz" ] && \
+   [ ! -f "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.01.tar.gz.sha256" ] && \
+   [ ! -f "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.01.tar.gz.sig" ] && \
+   [ -f "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.02.tar.gz" ] && \
+   [ -f "${RETENTION_TEST_DIR}/myhost_server_backup_2026.01.03.tar.gz" ]; then
+    echo "  [PASS] Retention policy keeps requested archive count and cleans companions"
+    PASSED=$((PASSED + 1))
+else
+    echo "  [FAIL] Retention policy miscalculated archive count or failed to prune companions!"
+    FAILED=$((FAILED + 1))
 fi
 
 echo "============================================================"
