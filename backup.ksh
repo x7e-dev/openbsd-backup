@@ -553,7 +553,11 @@ if [ "$USE_XZ" -eq 1 ]; then
     TEST_FLAG="-tJf"
 
     # In low-memory environments (e.g. VPS with <= 1GB RAM), bound XZ memory
-    PHYSMEM_BYTES=$(sysctl -n hw.physmem64 2>/dev/null || sysctl -n hw.physmem 2>/dev/null || echo 0)
+    PHYSMEM_BYTES=$(sysctl -n hw.physmem 2>/dev/null || echo 0)
+    case "$PHYSMEM_BYTES" in
+        [0-9]*) ;;
+        *) PHYSMEM_BYTES=0 ;;
+    esac
     if [ "$PHYSMEM_BYTES" -gt 0 ] && [ "$PHYSMEM_BYTES" -le 1073741824 ]; then
         export XZ_OPT="${XZ_OPT:--T1 -M 256M}"
         echo "Notice: Low memory detected ($((PHYSMEM_BYTES / 1048576))MB). Restricting XZ: ${XZ_OPT}."
@@ -943,6 +947,12 @@ Architecture : $(sysctl -n hw.machine 2>/dev/null || uname -m)
 EOF
 
 # Detailed Hardware & Environment Classification
+PHYSMEM_BYTES=$(sysctl -n hw.physmem 2>/dev/null || echo 0)
+case "$PHYSMEM_BYTES" in
+    [0-9]*) ;;
+    *) PHYSMEM_BYTES=0 ;;
+esac
+
 cat <<HWEOF > "${SYSINFO_DIR}/hardware_type.txt"
 Hardware & Environment Classification:
 Classification : ${DETECTED_DETAIL}
@@ -953,7 +963,7 @@ Version        : $(sysctl -n hw.version 2>/dev/null || echo "Unknown")
 UUID           : $(sysctl -n hw.uuid 2>/dev/null || echo "Unknown")
 CPU Model      : $(sysctl -n hw.model 2>/dev/null || echo "Unknown")
 CPU Cores      : $(sysctl -n hw.ncpusfound 2>/dev/null || echo "Unknown") (online: $(sysctl -n hw.ncpus 2>/dev/null || echo "Unknown"))
-Physical RAM   : $(( $(sysctl -n hw.physmem64 2>/dev/null || sysctl -n hw.physmem 2>/dev/null || echo 0) / 1048576 )) MB
+Physical RAM   : $(( PHYSMEM_BYTES / 1048576 )) MB
 Disks (hw)     : $(sysctl -n hw.disknames 2>/dev/null || echo "Unknown")
 HWEOF
 

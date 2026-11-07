@@ -106,11 +106,11 @@ sysctl() {
         hw.version) echo "$MOCK_HW_VERSION" ;;
         hw.disknames) echo "$MOCK_HW_DISKNAMES" ;;
         hw.sensors) echo "$MOCK_SENSORS" ;;
-        hw.physmem64|hw.physmem) echo "2147483648" ;;
+        hw.physmem) echo "2147483648" ;;
         hw.model) echo "Intel(R) Core(TM)" ;;
         hw.ncpusfound) echo "4" ;;
         hw.ncpus) echo "4" ;;
-        *) echo "" ;;
+        *) return 1 ;;
     esac
 }
 
@@ -287,6 +287,14 @@ case "$TEST_CASE" in
         fi
         echo "XZ_OPT:$XZ_OPT"
         ;;
+    physmem_calc)
+        PHYSMEM_BYTES=$(sysctl -n hw.physmem 2>/dev/null || echo 0)
+        case "$PHYSMEM_BYTES" in
+            [0-9]*) ;;
+            *) PHYSMEM_BYTES=0 ;;
+        esac
+        echo "RAM:$(( PHYSMEM_BYTES / 1048576 )) MB"
+        ;;
 esac
 KSH_TEST_EOF
 
@@ -304,6 +312,7 @@ assert_output_contains "Detect PowerEdge as Server" "server:Bare-metal Physical 
 
 assert_output_contains "XZ option on <=1GB RAM bounds memory (-T1 -M 256M)" "XZ_OPT:-T1 -M 256M" ksh "${SCRIPT_EXTRACT}" xz_opt_lowmem
 assert_output_contains "XZ option on >1GB RAM enables multi-core (-T0)" "XZ_OPT:-T0" ksh "${SCRIPT_EXTRACT}" xz_opt_highmem
+assert_output_contains "Physical RAM arithmetic via hw.physmem" "RAM:2048 MB" ksh "${SCRIPT_EXTRACT}" physmem_calc
 
 # Test 4: End-to-end archive metadata and restore.ksh --show-info verification
 echo "4. Testing restore.ksh inspection of generated metadata..."
