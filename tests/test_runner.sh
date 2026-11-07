@@ -560,6 +560,8 @@ SECRETS_TEST_DIR="${TEST_TMP}/secrets_test"
 mkdir -p "${SECRETS_TEST_DIR}/etc/ssh"
 mkdir -p "${SECRETS_TEST_DIR}/etc/ssl/private"
 mkdir -p "${SECRETS_TEST_DIR}/home/user/.ssh"
+mkdir -p "${SECRETS_TEST_DIR}/home/user/.vim/undo"
+mkdir -p "${SECRETS_TEST_DIR}/home/user/.sndio"
 
 echo "root:*:0:0:daemon:/root:/bin/ksh" > "${SECRETS_TEST_DIR}/etc/passwd"
 echo "root:\$2b\$10\$hash:0:0:daemon:0:0:daemon:/root:/bin/ksh" > "${SECRETS_TEST_DIR}/etc/master.passwd"
@@ -569,6 +571,10 @@ echo "TLS_KEY" > "${SECRETS_TEST_DIR}/etc/ssl/private/server.key"
 echo "USER_PRIVATE_KEY" > "${SECRETS_TEST_DIR}/home/user/.ssh/id_ed25519"
 echo "ssh-ed25519 AAAAC3... user" > "${SECRETS_TEST_DIR}/home/user/.ssh/id_ed25519.pub"
 echo "ssh-ed25519 AAAAC3... auth" > "${SECRETS_TEST_DIR}/home/user/.ssh/authorized_keys"
+echo "UNDO_SECRET" > "${SECRETS_TEST_DIR}/home/user/.vim/undo/%home%user%.ssh%id_ed25519"
+echo "VIMINFO_HISTORY" > "${SECRETS_TEST_DIR}/home/user/.viminfo"
+echo "XAUTH_COOKIE" > "${SECRETS_TEST_DIR}/home/user/.Xauthority"
+echo "SNDIO_COOKIE" > "${SECRETS_TEST_DIR}/home/user/.sndio/cookie"
 
 SECRETS_ARCHIVE="${TEST_TMP}/secrets_archive.tar.gz"
 
@@ -586,6 +592,11 @@ tar -czf "${SECRETS_ARCHIVE}" \
     -s ',.*/etc/ssl/private/.*,,' \
     -s ',.*/etc/ssl/private$,,' \
     -s ',.*\.ssh/id_.*,,' \
+    -s ',.*\.vim/undo/.*,,' \
+    -s ',.*\.vim/undo$,,' \
+    -s ',.*\.viminfo$,,' \
+    -s ',.*\.Xauthority$,,' \
+    -s ',.*\.sndio/cookie$,,' \
     -C "${SECRETS_TEST_DIR}" etc home
 
 SECRETS_CONTENT=$(tar -tzf "${SECRETS_ARCHIVE}")
@@ -594,13 +605,13 @@ assert_output_contains "--skip-secrets preserves /etc/passwd" "etc/passwd" echo 
 assert_output_contains "--skip-secrets preserves SSH host public key" "etc/ssh/ssh_host_ed25519_key.pub" echo "$SECRETS_CONTENT"
 assert_output_contains "--skip-secrets preserves authorized_keys" "home/user/.ssh/authorized_keys" echo "$SECRETS_CONTENT"
 
-if echo "$SECRETS_CONTENT" | grep -qE 'master\.passwd|ssh_host_ed25519_key$|private/server\.key|id_ed25519$'; then
+if echo "$SECRETS_CONTENT" | grep -qE 'master\.passwd|ssh_host_ed25519_key$|private/server\.key|id_ed25519$|\.vim/undo|\.viminfo|\.Xauthority|\.sndio/cookie'; then
     echo "  [FAIL] Sensitive files were not excluded by --skip-secrets rules!"
     echo "  Archive contents:"
     echo "$SECRETS_CONTENT"
     FAILED=$((FAILED + 1))
 else
-    echo "  [PASS] Sensitive files (master.passwd, host keys, TLS keys, user id keys) properly excluded"
+    echo "  [PASS] Sensitive files (master.passwd, host keys, TLS keys, user id keys, vim undo/viminfo, session cookies) properly excluded"
     PASSED=$((PASSED + 1))
 fi
 

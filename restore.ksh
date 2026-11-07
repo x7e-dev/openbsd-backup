@@ -22,6 +22,7 @@
 # ==============================================================================
 
 set -e
+set -o pipefail 2>/dev/null || true
 
 # Enforce strict permissions for all extraction and workspace operations (0700 dirs, 0600 files)
 umask 077
@@ -644,9 +645,9 @@ restore_config() {
         tar -czf "$ETC_BAK" -C / etc 2>/dev/null || true
     fi
     
-    # Filter targets inside the archive that correspond to /etc, /root, and dotfiles
+    # Filter targets inside the archive that correspond to /etc, /root, user scripts, and dotfiles
     tar ${TAR_TEST_FLAG} "${ARCHIVE}" > "${TMP_WORKDIR}/full_list.txt"
-    grep -E '^(etc/|root/|home/[^/]+/\.[^/]+|usr/local/bin/|usr/local/sbin/|var/cron/tabs/)' \
+    grep -E '^(\./)?(etc/|root/|home/[^/]+/(\.[^/]+|bin/)|usr/local/bin/|usr/local/sbin/|var/cron/tabs/)' \
         "${TMP_WORKDIR}/full_list.txt" > "${TMP_WORKDIR}/config_list.txt" || true
 
     if [ ! -s "${TMP_WORKDIR}/config_list.txt" ]; then

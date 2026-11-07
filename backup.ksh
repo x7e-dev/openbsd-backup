@@ -36,6 +36,7 @@
 # ==============================================================================
 
 set -e
+set -o pipefail 2>/dev/null || true
 
 # Enforce strict permissions from the very beginning (0600 files, 0700 dirs)
 # Prevents sensitive private keys, shadow passwords, and DB dumps from exposure.
@@ -636,11 +637,11 @@ if [ "$PROFILE" = "config" ]; then
             for dotitem in \
                 .config .local/bin bin \
                 .xsession .xinitrc .Xdefaults .Xresources .xprofile \
-                .cwmrc .fvwmrc .dwm .i3 .sway \
-                .profile .kshrc .zshrc .bashrc .tmux.conf \
+                .cwmrc .conkyrc .fvwmrc .dwm .i3 .sway \
+                .profile .kshrc .cshrc .login .zshrc .bashrc .tmux.conf \
                 .ssh .gnupg .password-store \
-                .vim .vimrc .emacs.d .neovim .gitconfig \
-                .fonts .themes .icons .mail .mutt .neomutt .newsboat; do
+                .vim .vimrc .emacs.d .neovim .gitconfig .cvsrc \
+                .fonts .themes .icons .mail .mailrc .mutt .neomutt .newsboat; do
                 if [ -e "${user_dir}/${dotitem}" ]; then
                     set -A TARGETS -- "${TARGETS[@]}" "${u_rel}/${dotitem}"
                 fi
@@ -781,13 +782,18 @@ if [ "$SKIP_SECRETS" -eq 1 ]; then
     add_exclude_rule "^etc/ipsec\.secrets\$"
     add_exclude_rule ".*/etc/ipsec\.secrets\$"
 
-    # User private SSH keys and credentials
+    # User private SSH keys, GPG secret keys, session cookies, and editor undo state
     add_exclude_rule ".*\.ssh/id_.*"
     add_exclude_rule ".*\.ssh/.*\.pem\$"
     add_exclude_rule ".*\.ssh/.*\.key\$"
     add_exclude_rule ".*\.gnupg/private-keys-v1\.d/.*"
     add_exclude_rule ".*\.gnupg/secring\.gpg\$"
     add_exclude_rule ".*\.password-store/.*"
+    add_exclude_rule ".*\.vim/undo/.*"
+    add_exclude_rule ".*\.vim/undo\$"
+    add_exclude_rule ".*\.viminfo\$"
+    add_exclude_rule ".*\.Xauthority\$"
+    add_exclude_rule ".*\.sndio/cookie\$"
 
     # Disable database dumps when skipping secrets
     BACKUP_MARIADB=0
@@ -854,6 +860,7 @@ if [ "$NO_EXCLUDES" -eq 0 ]; then
         add_exclude_dir ".pytest_cache"
         add_exclude_file "*.core"
         add_exclude_file "*.swp"
+        add_exclude_file "recently-used.xbel"
     fi
 
     if [ "$INCLUDE_DOWNLOADS" -eq 0 ] && [[ "$PROFILE" == "desktop" || "$PROFILE" == "laptop" ]]; then
@@ -1128,6 +1135,7 @@ cat << 'RESCUE_EOF' > "${SYSINFO_DIR}/quick-restore.sh"
 #!/bin/sh
 # Autonomous Emergency Recovery Helper embedded in OpenBSD backup archive
 set -e
+set -o pipefail 2>/dev/null || true
 if [ "$(id -u)" -ne 0 ]; then
     echo "Error: Must be run as root." >&2
     exit 1

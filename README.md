@@ -59,10 +59,11 @@ Engineered with specialized support for:
 - **Hardened Security by Default:**
   - Enforces `umask 077` throughout both `backup.ksh` and `restore.ksh` (`0600` archive / `0700` working directories), guaranteeing sensitive data (such as `/etc/master.passwd`, SSH host keys, WireGuard keys, and database dumps) is never world-readable.
   - **Cryptographic Signatures (`signify`):** Native OpenBSD `signify(1)` archive signing (`-S / --sign`) and verification (`--sig-key`), ensuring authenticity and tamper prevention.
-  - **Secrets Isolation (`--skip-secrets`):** Safely excludes password hashes, private host/user keys, and databases for untrusted destinations or environment sync; enabled by default on the `config` profile.
+  - **Secrets Isolation (`--skip-secrets`):** Safely excludes password hashes, private host/user keys, session cookies (`.Xauthority`, `sndio`), editor undo history (`.vim/undo`), and databases for untrusted destinations or environment sync; enabled by default on the `config` profile.
   - **Strict Archive Ownership:** Backups containing system secrets retain `root:wheel` (`0600`) ownership to prevent privilege leakage to non-root users (`--chown` permits transfer when secrets are excluded).
   - **Live Restoration Guardrails:** `restore.ksh` creates an automatic `/var/backups/etc.pre-restore.<timestamp>.tar.gz` safety snapshot, isolates metadata from polluting the destination root, and prompts for confirmation before overwriting live configurations.
 - **Production-Grade Reliability:**
+  - Pipeline termination safety (`set -o pipefail`) across backup, restore, and rescue helper scripts to catch intermediate pipeline command failures.
   - File locking (`/var/run/openbsd-backup.lock`) with active PID detection to prevent overlapping cron runs.
   - Pre-flight storage checks (`df -k`) on scratch and target directories with fail-safe aborts to prevent filesystem exhaustion.
   - Streaming database compression (`.sql.gz`) with PATH-independent daemon discovery.
@@ -238,7 +239,7 @@ restore.ksh --list hostname_server_backup_2026.09.05-12.00.00.tar.gz pf.conf
 # 5. Simulate a restore without touching the filesystem (Dry-Run):
 restore.ksh --config-only --dry-run hostname_server_backup_2026.09.05-12.00.00.tar.gz
 
-# 6. Restore only /etc, /root, and user dotfiles (prompts confirmation & saves /etc snapshot):
+# 6. Restore only /etc, /root, user scripts, and dotfiles (prompts confirmation & saves /etc snapshot):
 doas restore.ksh --config-only hostname_server_backup_2026.09.05-12.00.00.tar.gz
 
 # 7. Extract archive into a staging or chroot directory:
@@ -292,7 +293,7 @@ The `--skip-secrets` flag (automatically enabled by default on the `config` prof
 - **System Credential Databases:** Excludes `/etc/master.passwd`, `/etc/spwd.db`, `/etc/shadow`, and `/etc/skey`. Retains world-readable `/etc/passwd` so UID/GID mappings and login shells remain intact.
 - **SSH Host Private Keys:** Excludes `/etc/ssh/ssh_host_*_key`. Retains `/etc/ssh/ssh_host_*_key.pub` and user `authorized_keys`.
 - **TLS & VPN Credentials:** Excludes `/etc/ssl/private/*`, `/etc/wireguard/*.key`, and `/etc/ipsec.secrets`.
-- **User Identity Keys:** Excludes user private keys matching `~/.ssh/id_*`, `~/.ssh/*.pem`, `~/.ssh/*.key`, `~/.gnupg/private-keys-v1.d/*`, `~/.gnupg/secring.gpg`, and `~/.password-store/*`.
+- **User Identity Keys & Session State:** Excludes user private keys and session/editor artifacts matching `~/.ssh/id_*`, `~/.ssh/*.pem`, `~/.ssh/*.key`, `~/.gnupg/private-keys-v1.d/*`, `~/.gnupg/secring.gpg`, `~/.password-store/*`, `~/.vim/undo/*`, `~/.viminfo`, `~/.Xauthority`, and `~/.sndio/cookie`.
 - **Database Dumps:** Automatically skips MariaDB and PostgreSQL dumps when `--skip-secrets` is active to avoid database credential/data leakage.
 
 ### Ownership Model & Privilege Containment (`--chown`)
@@ -342,7 +343,7 @@ To adhere to the principle of least privilege, `restore.ksh` allows read-only an
 | `restore.ksh` | `-S, --sig-key PUBKEY`| Validate OpenBSD `signify` digital signature | **No** *(with `-c` / `-i`)* |
 | `restore.ksh` | `-d, --diff` | Diff archive files against live system | **No** *(unless inspecting root-only files)* |
 | `restore.ksh` | `-l, --list` | List or search contents within archive | **No** |
-| `restore.ksh` | `-C, --config-only` | Restore `/etc`, `/root`, and user dotfiles | **Yes** |
+| `restore.ksh` | `-C, --config-only` | Restore `/etc`, `/root`, user scripts, and dotfiles | **Yes** |
 | `restore.ksh` | `-F, --full` | Full extraction of archive to target filesystem | **Yes** |
 | `restore.ksh` | `-p, --install-pkgs`| Reinstall recorded packages via `pkg_add -l` | **Yes** |
 | `restore.ksh` | `-s, --enable-services` | Re-enable daemons via `rcctl` | **Yes** |
@@ -459,7 +460,7 @@ When `--skip-secrets` is enabled (or on the `config` profile), the following tar
 - System hashes and shadow tables: `/etc/master.passwd`, `/etc/spwd.db`, `/etc/shadow`, `/etc/skey`
 - Host private keys: `/etc/ssh/ssh_host_*_key` (public `.pub` keys and `authorized_keys` are preserved)
 - TLS & VPN keys: `/etc/ssl/private/*`, `/etc/wireguard/*.key`, `/etc/ipsec.secrets`
-- User private keys: `~/.ssh/id_*`, `~/.ssh/*.pem`, `~/.ssh/*.key`, `~/.gnupg/private-keys-v1.d/*`, `~/.gnupg/secring.gpg`, `~/.password-store/*`
+- User private keys & session state: `~/.ssh/id_*`, `~/.ssh/*.pem`, `~/.ssh/*.key`, `~/.gnupg/private-keys-v1.d/*`, `~/.gnupg/secring.gpg`, `~/.password-store/*`, `~/.vim/undo/*`, `~/.viminfo`, `~/.Xauthority`, `~/.sndio/cookie`
 - Automated database dumps: MariaDB and PostgreSQL dumps are suppressed
 
 ### Default Cache & Ephemeral Exclusions
@@ -472,7 +473,7 @@ In addition to loop safeguards, the `desktop` and `laptop` profiles skip ephemer
   - Java: `~/.gradle/caches`, `~/.m2/repository`
   - Node: `node_modules`
   - Python: `__pycache__`, `.pytest_cache`, `.venv`, `venv`
-- **Transient Files:** `*.core`, `*.swp`
+- **Transient Files:** `*.core`, `*.swp`, `recently-used.xbel`
 - **Downloads:** `~/Downloads` (excluded on `desktop` and `laptop`; bypass with `-D`)
 
 ### Custom Exclusions
@@ -585,7 +586,7 @@ Configure automated recurring backups by editing root's crontab (`doas crontab -
 
 ## Testing & Verification
 
-An automated verification test suite containing 49 comprehensive assertions is provided in [`tests/test_runner.sh`](tests/test_runner.sh). It validates shell syntax across `/bin/ksh` and `/bin/sh`, argument parsing, profile normalization/aliases, environment auto-detection heuristics against mocked platforms (bare-metal physical servers, desktop workstations, ThinkPad laptops, and QEMU/Vultr cloud VMs), memory detection and arithmetic (`hw.physmem`), native OpenBSD `tar -s` regex exclusions, live UNIX domain socket handling, security hardening features (strict `umask 077` enforcement, delimiter collision safety, `--skip-secrets` credential isolation while retaining public keys, signify signature verification), retention policy archive counting and companion pruning, backward-compatible restoration from legacy metadata formats (`openbsd_sysinfo.*`), full restore root metadata isolation, and end-to-end archive verification and inspection via [`restore.ksh`](restore.ksh).
+An automated verification test suite containing 49 comprehensive assertions is provided in [`tests/test_runner.sh`](tests/test_runner.sh). It validates shell syntax across `/bin/ksh` and `/bin/sh`, argument parsing, profile normalization/aliases, environment auto-detection heuristics against mocked platforms (bare-metal physical servers, desktop workstations, ThinkPad laptops, and QEMU/Vultr cloud VMs), memory detection and arithmetic (`hw.physmem`), native OpenBSD `tar -s` regex exclusions, live UNIX domain socket handling, security hardening features (strict `umask 077` enforcement, delimiter collision safety, `--skip-secrets` credential and session state isolation while retaining public keys, signify signature verification), retention policy archive counting and companion pruning, backward-compatible restoration from legacy metadata formats (`openbsd_sysinfo.*`), full restore root metadata isolation, and end-to-end archive verification and inspection via [`restore.ksh`](restore.ksh).
 
 To run the test suite:
 
