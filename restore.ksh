@@ -682,6 +682,14 @@ show_info() {
             echo "------------------------------------------------------------"
         fi
 
+        if ls "${SYSINFO}"/notmuch_tags_*.dump.gz >/dev/null 2>&1; then
+            echo "Notmuch Mail Tag Dumps Recorded:"
+            for nm in "${SYSINFO}"/notmuch_tags_*.dump.gz; do
+                [ -f "$nm" ] && echo "  - ${nm##*/} ($(ls -lh "$nm" | awk '{print $5}'))"
+            done
+            echo "------------------------------------------------------------"
+        fi
+
         if [ -f "${SYSINFO}/duids.txt" ]; then
             echo "Disk and Partition Layout (DUIDs):"
             head -n 12 "${SYSINFO}/duids.txt" | sed 's/^/  /'

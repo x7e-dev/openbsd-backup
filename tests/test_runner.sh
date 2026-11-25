@@ -140,6 +140,13 @@ assert_success "restore.ksh verifies embedded signatures via signify -C" grep -F
 assert_success "restore.ksh rebuilds pwd_mkdb on master.passwd restore" grep -Fq 'pwd_mkdb -p /etc/master.passwd' "${REPO_DIR}/restore.ksh"
 assert_success "backup.ksh captures sndioctl desktop audio state" grep -Fq 'sndioctl_state.txt' "${REPO_DIR}/backup.ksh"
 assert_success "backup.ksh captures Raspberry Pi MSDOS boot partition" grep -Fq 'rpi_boot' "${REPO_DIR}/backup.ksh"
+assert_success "backup.ksh excludes reconstructible .notmuch/xapian index" grep -Fq 'add_exclude_dir ".notmuch/xapian"' "${REPO_DIR}/backup.ksh"
+assert_success "backup.ksh tolerates OpenBSD tar 'was modified during copy to archive'" grep -Fq 'was modified during copy to archive' "${REPO_DIR}/backup.ksh"
+assert_success "backup.ksh excludes OpenSSH 10.1+ .ssh/agent/* sockets" grep -Fq 'add_exclude_rule ".*\.ssh/agent/.*"' "${REPO_DIR}/backup.ksh"
+TAR_FILTER_LINE=$(grep 'FATAL_TAR_ERRS=' "${REPO_DIR}/backup.ksh")
+TAR_FILTER_REGEX=$(printf "%s" "$TAR_FILTER_LINE" | sed -E "s/.*grep -viE '([^']+)'.*/\1/")
+assert_output_not_matches "tar warning filter tolerates OpenBSD 'Ustar cannot archive a socket'" "." sh -c "printf '%s\n' 'tar: Ustar cannot archive a socket home/ms/.ssh/agent/s.7TtvMAr0tt.local.40269.WUa4R5tazs' | grep -viE '${TAR_FILTER_REGEX}' || true"
+assert_output_contains "tar warning filter still fails on real permission error" "Permission denied" sh -c "printf '%s\n' 'tar: Unable to access /etc/master.passwd (Permission denied)' | grep -viE '${TAR_FILTER_REGEX}' || true"
 assert_success "backup.ksh enforces umask 077" grep -qE '^umask 077' "${REPO_DIR}/backup.ksh"
 assert_success "restore.ksh enforces umask 077" grep -qE '^umask 077' "${REPO_DIR}/restore.ksh"
 
@@ -255,15 +262,17 @@ case "$1" in
         add_exclude_rule ".*_backup_.*\.sig\$"
         add_exclude_rule ".*/\..*_backup_.*\.tmp\..*"
         add_exclude_rule ".*\.gnupg/S\..*"
+        add_exclude_rule ".*\.ssh/agent/.*"
         add_exclude_rule ".*\.sock\$"
         # Anchored mfs /tmp mount exclusion
         add_exclude_rule "^tmp\$"
         add_exclude_rule "^tmp/.*"
-        # Firefox cache only (keeps storage/default)
+        # Firefox cache only (keeps storage/default) & Notmuch Xapian index
         add_exclude_rule ".*/\.mozilla/firefox/[^/]*/cache2\$"
         add_exclude_rule ".*/\.mozilla/firefox/[^/]*/cache2/.*"
         add_exclude_rule ".*/\.mozilla/firefox/[^/]*/storage/temporary\$"
         add_exclude_rule ".*/\.mozilla/firefox/[^/]*/storage/temporary/.*"
+        add_exclude_dir ".notmuch/xapian"
         # Custom user exclusions
         add_user_exclude "home/user/Videos"
         add_user_exclude "*.log"
@@ -296,10 +305,16 @@ mkdir -p "${LOOP_DIR}/home/user/Videos" \
          "${LOOP_DIR}/home/user/VirtualBox VMs" \
          "${LOOP_DIR}/home/user/project/tmp" \
          "${LOOP_DIR}/home/user/.gnupg" \
+         "${LOOP_DIR}/home/user/.ssh/agent" \
          "${LOOP_DIR}/home/user/.mozilla/firefox/abc.default/cache2" \
          "${LOOP_DIR}/home/user/.mozilla/firefox/abc.default/storage/default" \
          "${LOOP_DIR}/home/user/.mozilla/firefox/abc.default/storage/temporary" \
+         "${LOOP_DIR}/home/user/.mail/.notmuch/xapian" \
+         "${LOOP_DIR}/home/user/.mail/Inbox/cur" \
          "${LOOP_DIR}/tmp"
+
+touch "${LOOP_DIR}/home/user/.mail/.notmuch/xapian/termlist.glass"
+touch "${LOOP_DIR}/home/user/.mail/Inbox/cur/msg1:2,S"
 
 touch "${LOOP_DIR}/home/user/important_file.txt"
 touch "${LOOP_DIR}/home/user/my_personal_release.tar.gz"
@@ -318,7 +333,9 @@ touch "${LOOP_DIR}/home/user/.myhost_server_backup_2026.tmp.12345"
 touch "${LOOP_DIR}/home/user/.mozilla/firefox/abc.default/cache2/blob"
 touch "${LOOP_DIR}/home/user/.mozilla/firefox/abc.default/storage/default/ublock.sqlite"
 touch "${LOOP_DIR}/home/user/.mozilla/firefox/abc.default/storage/temporary/temp.sqlite"
-python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('${LOOP_DIR}/home/user/.gnupg/S.gpg-agent'); s.close()" 2>/dev/null || true
+touch "${LOOP_DIR}/home/user/.ssh/config"
+python3 -c "import os, socket; os.chdir('${LOOP_DIR}/home/user/.gnupg'); s = socket.socket(socket.AF_UNIX); s.bind('S.gpg-agent'); s.close()" 2>/dev/null || true
+python3 -c "import os, socket; os.chdir('${LOOP_DIR}/home/user/.ssh/agent'); s = socket.socket(socket.AF_UNIX); s.bind('s.7TtvMAr0tt.local.40269.WUa4R5tazs'); s.close()" 2>/dev/null || true
 
 LOOP_LIST=$(ksh "${EXCL_HARNESS}" user_and_loop "${LOOP_DIR}" "${TEST_TMP}/loop.tar.gz")
 
@@ -328,12 +345,16 @@ assert_output_contains "Preserves user personal .tgz file" "home/user/my_persona
 assert_output_contains "Preserves user project/tmp despite anchored /tmp mfs rule" "home/user/project/tmp/keep_this.txt" echo "$LOOP_LIST"
 assert_output_contains "Anchored *.log preserves app.login" "home/user/app.login" echo "$LOOP_LIST"
 assert_output_contains "Preserves Firefox extension storage/default" "storage/default/ublock.sqlite" echo "$LOOP_LIST"
+assert_output_contains "Preserves user .ssh/config alongside agent socket exclusion" "home/user/.ssh/config" echo "$LOOP_LIST"
 assert_output_not_matches "Excludes prior backup archives" "myhost_server_backup_2026" echo "$LOOP_LIST"
 assert_output_not_matches "Excludes live gpg socket" "S\.gpg-agent" echo "$LOOP_LIST"
+assert_output_not_matches "Excludes OpenSSH 10.1+ ssh-agent socket" "\.ssh/agent/s\." echo "$LOOP_LIST"
 assert_output_not_matches "Excludes anchored /tmp mfs mount" "^tmp/mfs_ephemeral\.txt$" echo "$LOOP_LIST"
 assert_output_not_matches "Excludes top-level -x home/user/Videos" "Videos/movie\.mp4$" echo "$LOOP_LIST"
 assert_output_not_matches "Excludes -x */VirtualBox VMs" "vm\.vdi$" echo "$LOOP_LIST"
 assert_output_not_matches "Excludes -x *.log" "app\.log$" echo "$LOOP_LIST"
+assert_output_contains "Preserves actual Maildir messages" "Inbox/cur/msg1:2,S" echo "$LOOP_LIST"
+assert_output_not_matches "Excludes reconstructible .notmuch/xapian index" "\.notmuch/xapian/termlist\.glass$" echo "$LOOP_LIST"
 assert_output_not_matches "Excludes Firefox cache2" "cache2/blob$" echo "$LOOP_LIST"
 assert_output_not_matches "Excludes Firefox storage/temporary" "storage/temporary/temp\.sqlite$" echo "$LOOP_LIST"
 

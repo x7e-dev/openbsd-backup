@@ -55,7 +55,7 @@ Engineered with specialized support for:
   - **Root Slice Space Guard:** Automatically detects if the destination is on the root filesystem (`/`) and warns the user to prevent filling OpenBSD's typically small (1–2GB) `/` slice.
   - **Strict Recursion & Loop Prevention:** Always excludes prior backup archives (`*_backup_*.tar.*`, `*_backup_*.sha256*`, `*_backup_*.sig`), temporary staging files, and anchored foreign/network mountpoints (`nfs`, `fuse`, `fusefs`/sshfs, `mfs`, `tmpfs`, `smbfs`) without dropping personal `.tar.gz`/`.tar.xz`/`.tgz` archives or unrelated `*/tmp/*` directories.
   - **Native OpenBSD tar(1) Compatibility:** Leverages OpenBSD `tar(1)` / `pax(1)` native `-s replstr` exclusions (`-s ',pattern,,'`) and pipes compression through `gzip`/`xz`/`zstd` (avoiding unsupported OpenBSD `tar -J`), guaranteeing 100% base OpenBSD compatibility without external `gtar`.
-  - **UNIX Domain Socket Exclusions:** Proactively skips active IPC sockets (`.gnupg/S.*`, `*.sock`, `*.socket`), while strictly failing on real `tar` read/I/O/permission errors.
+  - **UNIX Domain Socket Exclusions:** Proactively skips active IPC sockets (`.gnupg/S.*`, `.ssh/agent/*`, `*.sock`, `*.socket`), while tolerating any remaining live `ustar` socket warnings and strictly failing on real `tar` read/I/O/permission errors.
   - **Laptop Battery Protection:** Pre-flight battery check warns or prevents running heavy compression operations on low battery (≤ 20%) to avoid sudden shutdown.
   - **Zstandard & Adaptive RAM-Bounded XZ Compression:** Supports fast, low-memory Zstandard (`-Z / --zstd`, ideal for Raspberry Pi and VPS) alongside piped XZ (`-J / --xz`) with 3-tier RAM caps (`<= 1GB`: `-T1 -M 256M`, `<= 4GB`: `-T2 -M 40%`, `> 4GB`: `-T0 -M 50%`) to prevent OOM and OpenBSD `login.conf` `datasize` failures.
 - **Hardened Security by Default:**
@@ -127,6 +127,7 @@ archive.tar.gz (or .tar.xz / .tar.zst / .age)
     ├── wireless_interfaces.txt   # Wireless interface link status, SSID, capabilities (laptop)
     ├── cloud_metadata.txt        # Cloud provider hints, VirtIO devices, cloud-init (VPS)
     ├── sqlite/                   # Safe live SQLite snapshots (--sqlite)
+    ├── notmuch_tags_<user>.dump.gz # Compressed Notmuch tag dump (paired with .notmuch/xapian exclusion)
     └── *.sql.gz                  # Compressed MariaDB / PostgreSQL database dumps
 ```
 
@@ -504,7 +505,7 @@ OpenBSD's native `tar(1)` (based on `pax(1)`) does not support GNU `--exclude` o
 To prevent accidental recursion, exponential archive expansion, socket errors, and corrupted backup data, `backup.ksh` strictly enforces these exclusions on every run across all profiles (while **preserving** personal `.tar.gz`/`.tar.xz`/`.tgz` files in `/home` or `/var/www`):
 - **Prior Backup Archives, Checksums & Signatures:** `.*_backup_.*\.tar\..*`, `.*_backup_.*\.tgz.*`, `.*_backup_.*\.sha256.*`, `.*_backup_.*\.sig$`
 - **Temporary Staging & Pre-Restore Files:** `.*/\..*_backup_.*\.tmp\..*`, `^var/backups/etc\.pre-restore\..*\.tar\.gz$`
-- **UNIX Domain Sockets:** `.*\.gnupg/S\..*`, `.*\.sock$`, `.*\.socket$` (OpenBSD `ustar` format cannot archive dynamic IPC sockets)
+- **UNIX Domain Sockets:** `.*\.gnupg/S\..*`, `.*\.ssh/agent/.*`, `.*\.sock$`, `.*\.socket$` (OpenBSD `ustar` format cannot archive dynamic IPC sockets)
 - **Active Target Output Files:** Automatically excludes the current archive, staging temp file, checksum, and signature using regex-escaped basenames
 - **Anchored Foreign & Network Mounts:** Parses active mount points to exclude `nfs`, `fuse`, `fusefs`/sshfs, `mfs`, `tmpfs`, and `smbfs` anchored strictly at `^<mountpoint>` (so an `mfs` mount on `/tmp` never excludes unrelated `*/tmp/*` user directories)
 
@@ -529,6 +530,7 @@ In addition to loop safeguards, the `desktop` and `laptop` profiles skip ephemer
   - Java: `~/.gradle/caches`, `~/.m2/repository`
   - Node: `node_modules`
   - Python: `__pycache__`, `.pytest_cache`, `.venv`, `venv`
+- **Mail Search Indexes:** `.notmuch/xapian` (reconstructible Xapian index; tags are automatically captured via `notmuch dump` into `_sysinfo/notmuch_tags_<user>.dump.gz`)
 - **Transient Files:** `*.core`, `*.swp`, `recently-used.xbel`
 - **Downloads:** `~/Downloads` (excluded on `desktop` and `laptop`; bypass with `-D`)
 

@@ -1058,6 +1058,7 @@ add_exclude_rule "^var/backups/etc\.pre-restore\..*\.tar\.gz\$"
 
 # Sockets (OpenBSD ustar cannot archive sockets; dynamic IPC sockets should never be backed up)
 add_exclude_rule ".*\.gnupg/S\..*"
+add_exclude_rule ".*\.ssh/agent/.*"
 add_exclude_rule ".*\.sock\$"
 add_exclude_rule ".*\.socket\$"
 
@@ -1120,6 +1121,7 @@ if [ "$NO_EXCLUDES" -eq 0 ]; then
         add_exclude_dir "target/release"
         add_exclude_dir "__pycache__"
         add_exclude_dir ".pytest_cache"
+        add_exclude_dir ".notmuch/xapian"
         add_exclude_file "*.core"
         add_exclude_file "*.swp"
         add_exclude_file "recently-used.xbel"
@@ -1230,6 +1232,27 @@ if [ ${#SQLITE_DBS[@]} -gt 0 ]; then
         log_warn "Error: sqlite3 command not found (requested via --sqlite)."
         BACKUP_HAD_ERROR=1
     fi
+fi
+
+# Safe Notmuch tag dump (pairs with excluding reconstructible .notmuch/xapian index)
+if [ "$SKIP_SECRETS" -eq 0 ] && command -v notmuch >/dev/null 2>&1; then
+    for user_dir in /home/*; do
+        [ -d "$user_dir" ] && [ ! -L "$user_dir" ] || continue
+        u_name="${user_dir##*/}"
+        if [ -f "${user_dir}/.notmuch-config" ] || [ -d "${user_dir}/.config/notmuch" ] || [ -d "${user_dir}/.mail/.notmuch" ]; then
+            if id "$u_name" >/dev/null 2>&1; then
+                log_info "Capturing Notmuch tag dump for user '${u_name}'..."
+                if su -l "$u_name" -c "notmuch dump --format=batch-tag" 2>/dev/null \
+                    | gzip -c > "${SYSINFO_DIR}/notmuch_tags_${u_name}.dump.gz"; then
+                    gz_bytes=$(wc -c < "${SYSINFO_DIR}/notmuch_tags_${u_name}.dump.gz" 2>/dev/null || echo 0)
+                    [ "$gz_bytes" -lt 30 ] && rm -f "${SYSINFO_DIR}/notmuch_tags_${u_name}.dump.gz"
+                else
+                    rm -f "${SYSINFO_DIR}/notmuch_tags_${u_name}.dump.gz"
+                    log_warn "Warning: notmuch dump failed for user '${u_name}' (continuing)."
+                fi
+            fi
+        fi
+    done
 fi
 
 # ==============================================================================
@@ -1603,6 +1626,14 @@ if [ -d "${SYSINFO_DIR}/sqlite" ]; then
     echo ""
 fi
 
+for nm in "${SYSINFO_DIR}"/notmuch_tags_*.dump.gz; do
+    if [ -f "$nm" ]; then
+        echo "To rebuild Notmuch search index and restore tags (${nm##*/}), run:"
+        echo "  notmuch new && gunzip -c ${nm} | notmuch restore"
+        echo ""
+    fi
+done
+
 echo "IMPORTANT: When extracting onto a fresh OpenBSD install, exclude etc/fstab"
 echo "so you do not overwrite the new disk's DUIDs, and run pwd_mkdb -p /etc/master.passwd"
 echo "after restoring /etc/master.passwd:"
@@ -1672,8 +1703,9 @@ if [ "$COMP_EXIT" -ne 0 ] || [ ! -s "${TMP_BACKUP_FILE}" ]; then
 fi
 
 if [ "$TAR_EXIT" -ne 0 ]; then
-    # Filter out known benign live-socket/FIFO warnings; fail on ANY real read/permission/I/O error
-    FATAL_TAR_ERRS=$(grep -viE 'socket ignored|Cannot archive socket|is a socket|file type not supported|removing leading' "${TAR_ERR_FILE}" || true)
+    # Filter out known non-fatal live-filesystem warnings (sockets, files modified mid-read);
+    # fail hard on real I/O, read-fault, disk-full, or permission errors.
+    FATAL_TAR_ERRS=$(grep -viE 'socket ignored|Cannot archive (a )?socket|is a socket|file type not supported|removing leading|was modified during copy to archive|File changed size during read' "${TAR_ERR_FILE}" || true)
     if [ -n "$FATAL_TAR_ERRS" ]; then
         echo "Error: tar encountered fatal error(s) (exit code ${TAR_EXIT}):" >&2
         printf "%s\n" "$FATAL_TAR_ERRS" >&2
@@ -1682,7 +1714,7 @@ if [ "$TAR_EXIT" -ne 0 ]; then
     fi
 
     if [ -z "$ENCRYPT_KEY" ]; then
-        log_info "Validating archive integrity after socket warnings..."
+        log_info "Validating archive integrity after non-fatal tar warnings..."
         if ! validate_unencrypted_archive "${TMP_BACKUP_FILE}"; then
             cat "${TAR_ERR_FILE}" >&2
             echo "Error: Archive failed integrity validation after tar warnings." >&2
@@ -1690,8 +1722,9 @@ if [ "$TAR_EXIT" -ne 0 ]; then
             exit 1
         fi
     fi
-    log_warn "Notice: Archive integrity verified. Non-fatal socket warnings encountered:"
+    log_warn "Notice: Archive integrity verified. Non-fatal warnings encountered:"
     sed 's/^tar: /  - /' "${TAR_ERR_FILE}" >&2
+    syslog_msg warning "Backup completed with non-fatal tar warnings for ${FINAL_ARCHIVE_PATH}"
 fi
 
 # Move archive into final destination atomically
